@@ -1014,7 +1014,7 @@ function PaperEngineCard({account,setAccount,showToast}){
 // ═══════════════════════════════════════════
 function Dashboard({account,setAccount,signals,strategies,showToast,setScreen}){
   const mkts=useMemo(()=>MARKETS.map(m=>({...m,ch:pchg(m.price,m.prev)})),[]);
-  const openCount=account.openPositions.length;
+  const openCount=(account.openPositions||[]).filter(p=>p.paper).length;
   const activeStrats=strategies.filter(s=>s.status==='Demo Active').length;
   const pendingSigs=signals.filter(s=>s.status==='Pending').length;
   const equity=account.balance;
@@ -3020,23 +3020,90 @@ function App(){
   useEffect(()=>{LS.set('za_account',account);},[account]);
   useEffect(()=>{LS.set('za_risk',riskSettings);},[riskSettings]);
 
-  // One-time bootstrap: adopt the Supabase paper account balance if one
-  // already exists there and differs from a fresh R1,000 start — otherwise
-  // the Paper Engine's real trade history silently diverges from what this
-  // screen shows after a reload on a different device/session.
+  // Supabase is the authoritative source for paper-trade state.
+  // On startup, mirror the server paper ledger into the UI so Portfolio
+  // remains correct after refreshes, browser restarts, and new sessions.
   useEffect(()=>{
     let cancelled=false;
     (async()=>{
-      for(let i=0;i<20&&!window.ZuShePaperDB;i++){ await new Promise(r=>setTimeout(r,150)); }
+      for(let i=0;i<30&&!window.ZuShePaperDB;i++){
+        await new Promise(r=>setTimeout(r,150));
+      }
       if(cancelled||!window.ZuShePaperDB)return;
       try{
         const remote=await window.ZuShePaperDB.ensureAccount();
-        if(!remote||cancelled)return;
-        const remoteBalance=Number(remote.balance);
-        if(Number.isFinite(remoteBalance)&&Math.abs(remoteBalance-account.balance)>0.005){
-          setAccount(a=>({...a,balance:remoteBalance,equity:remoteBalance}));
-        }
-      }catch(err){ console.warn('[ZuShé Trader] Could not sync Supabase paper account:',err?.message||err); }
+        const rows=await window.ZuShePaperDB.loadTrades(200);
+        if(cancelled)return;
+
+        const openRows=(rows||[]).filter(t=>String(t.status).toUpperCase()==='OPEN');
+        const closedRows=(rows||[]).filter(t=>String(t.status).toUpperCase()==='CLOSED');
+
+        const remoteBalance=Number(remote?.balance);
+
+        setAccount(a=>{
+          const localClosed=Array.isArray(a.closedTrades)?a.closedTrades:[];
+
+          const openPositions=openRows.map(t=>({
+            id:t.metadata?.local_id || 'PT-'+t.id,
+            dbId:t.id,
+            pair:t.pair,
+            market:t.pair,
+            dir:t.direction,
+            entry:Number(t.entry_price)||0,
+            sl:Number(t.stop_price)||0,
+            tp:Number(t.take_profit)||0,
+            size:Number(t.quantity)||0,
+            risk:Number(t.risk_amount)||0,
+            strategy:t.strategy||'Combined',
+            strat:t.strategy||'Combined',
+            confidence:Number(t.metadata?.confidence||0),
+            openedAt:t.entry_time?new Date(t.entry_time).getTime():Date.now(),
+            openTime:t.entry_time,
+            paper:true,
+            sigId:t.metadata?.signal_id||null
+          }));
+
+          const serverClosed=closedRows.map(t=>({
+            id:t.metadata?.local_id || 'CT-'+t.id,
+            dbId:t.id,
+            pair:t.pair,
+            market:t.pair,
+            dir:t.direction,
+            entry:Number(t.entry_price)||0,
+            sl:Number(t.stop_price)||0,
+            tp:Number(t.take_profit)||0,
+            size:Number(t.quantity)||0,
+            risk:Number(t.risk_amount)||0,
+            strategy:t.strategy||'Combined',
+            strat:t.strategy||'Combined',
+            confidence:Number(t.metadata?.confidence||0),
+            openedAt:t.entry_time?new Date(t.entry_time).getTime():Date.now(),
+            openTime:t.entry_time,
+            exit:Number(t.exit_price)||0,
+            pl:Number(t.net_pnl ?? t.gross_pnl ?? 0),
+            closeTime:t.exit_time,
+            status:Number(t.net_pnl ?? t.gross_pnl ?? 0)>=0?'Win':'Loss',
+            trigger:t.exit_reason,
+            paper:true
+          }));
+
+          const serverIds=new Set(serverClosed.map(t=>t.dbId));
+          const preserved=localClosed.filter(t=>!t.dbId || !serverIds.has(t.dbId));
+          const balance=Number.isFinite(remoteBalance)?remoteBalance:a.balance;
+          const used=openPositions.reduce((sum,t)=>sum+(Number(t.risk)||0),0);
+
+          return {
+            ...a,
+            balance,
+            equity:balance,
+            used:parseFloat(used.toFixed(2)),
+            openPositions,
+            closedTrades:[...serverClosed,...preserved]
+          };
+        });
+      }catch(err){
+        console.warn('[ZuShé Trader] Could not sync Supabase paper trades:',err?.message||err);
+      }
     })();
     return()=>{cancelled=true;};
   },[]);
