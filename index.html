@@ -746,19 +746,39 @@ function Explain({icon,title,children}){
 // Compact inline label with explanation tooltip
 function HelpLabel({label,help,color}){
   const[show,setShow]=useState(false);
+  const[pos,setPos]=useState({top:0,left:0,width:220});
+  const btnRef=useRef(null);
+  const toggle=ev=>{
+    ev.stopPropagation();
+    if(!show&&btnRef.current){
+      const r=btnRef.current.getBoundingClientRect();
+      const vw=window.innerWidth;
+      const tipWidth=Math.min(220,vw-24);
+      let left=r.left;
+      if(left+tipWidth>vw-12)left=vw-tipWidth-12;
+      if(left<12)left=12;
+      setPos({top:r.bottom+6,left,width:tipWidth});
+    }
+    setShow(s=>!s);
+  };
   return e('div',{style:{position:'relative',display:'inline-flex',alignItems:'center',gap:4}},
     e('span',{style:{fontSize:9,fontFamily:'var(--mono)',color:color||'var(--text3)',letterSpacing:1.5,textTransform:'uppercase'}},label),
     e('span',{
-      onClick:ev=>{ev.stopPropagation();setShow(s=>!s);},
+      ref:btnRef,
+      onClick:toggle,
       style:{width:14,height:14,borderRadius:7,background:'var(--glass2)',border:'1px solid var(--border)',
         display:'inline-flex',alignItems:'center',justifyContent:'center',
         fontSize:9,color:'var(--text3)',cursor:'pointer',flexShrink:0}
     },'?'),
+    // position:fixed (not absolute) so this escapes .stat-box's
+    // overflow:hidden — which was silently clipping the tooltip text —
+    // and its left offset is measured + clamped against the real screen
+    // width so it can't run off either edge on narrow phones.
     show&&e('div',{
       onClick:()=>setShow(false),
-      style:{position:'absolute',top:20,left:0,zIndex:50,background:'var(--bg3)',border:'1px solid var(--border2)',
+      style:{position:'fixed',top:pos.top,left:pos.left,zIndex:200,background:'var(--bg3)',border:'1px solid var(--border2)',
         borderRadius:10,padding:'10px 12px',fontSize:11,color:'var(--text2)',lineHeight:1.6,
-        width:220,boxShadow:'0 8px 32px rgba(0,0,0,.6)'}
+        width:pos.width,boxShadow:'0 8px 32px rgba(0,0,0,.6)'}
     },help)
   );
 }
