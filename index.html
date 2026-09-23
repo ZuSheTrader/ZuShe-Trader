@@ -1209,7 +1209,7 @@ function mapDbSignalToUi(row,account){
   };
 }
 
-function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSettings,refreshSignals,signalsLoading}){
+function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSettings,refreshSignals,signalsLoading,livePrices}){
   const[tab,setTab]=useState('pending');
   const[showRej,setShowRej]=useState(null);
   const[rejReason,setRejReason]=useState('');
@@ -1264,7 +1264,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   ];
   const list={pending,accepted,watching,rejected}[tab]||[];
 
-  const SigCard=({sig})=>e('div',{className:'sig-card sig-'+sig.dir.toLowerCase()},
+  const SigCard=({sig,livePrice})=>e('div',{className:'sig-card sig-'+sig.dir.toLowerCase()},
     e('div',{className:'sig-accent'}),
     e('div',{className:'sig-body'},
       // Header
@@ -1293,6 +1293,11 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
       // Price levels
       e('div',{style:{background:'var(--glass)',borderRadius:10,padding:'10px 12px',marginBottom:10}},
         e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,marginBottom:8}},'PRICE LEVELS — WHERE TO ENTER, EXIT, AND STOP'),
+        e('div',{style:{textAlign:'center',marginBottom:10,paddingBottom:10,borderBottom:'1px solid var(--border)'}},
+          e('div',{style:{fontSize:9,color:'var(--cyan)',marginBottom:3}},'CURRENT PRICE'),
+          e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:16,color:'var(--cyan)'}},livePrice!=null?livePrice:'—'),
+          e('div',{style:{fontSize:9,color:'var(--text3)',marginTop:2}},livePrice!=null?'Live from Luno · updates every 60s':'Waiting for a live price…')
+        ),
         e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8}},
           e('div',{style:{textAlign:'center'}},
             e('div',{style:{fontSize:9,color:'var(--text3)',marginBottom:3}},'ENTRY'),
@@ -1392,7 +1397,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
               rejected:'No rejected signals. When you reject a signal you can add a reason — useful for journaling patterns.'
             }[tab])
           )
-        :list.map(sig=>e(SigCard,{key:sig.id,sig}))
+        :list.map(sig=>e(SigCard,{key:sig.id,sig,livePrice:livePrices&&livePrices[sig.pair]}))
     ),
     // Reject modal
     showRej&&e('div',{className:'ov',onClick:ev=>ev.target===ev.currentTarget&&setShowRej(null)},
@@ -1855,6 +1860,11 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
                 )
               ),
               e('div',{style:{background:'var(--glass)',borderRadius:8,padding:'10px',marginBottom:10}},
+                e('div',{style:{textAlign:'center',marginBottom:10,paddingBottom:10,borderBottom:'1px solid var(--border)'}},
+                  e('div',{style:{fontSize:9,color:'var(--cyan)',marginBottom:3}},'CURRENT PRICE'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:16,color:'var(--cyan)'}},lastPx!=null?lastPx:'—'),
+                  e('div',{style:{fontSize:9,color:'var(--text3)',marginTop:2}},lastPx!=null?'Live from Luno · updates every 60s':'Waiting for a live price…')
+                ),
                 e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,textAlign:'center'}},
                   e('div',null,
                     e('div',{style:{fontSize:9,color:'var(--text3)',marginBottom:2}},'YOU ENTERED AT'),
@@ -3041,14 +3051,20 @@ function App(){
   const[livePrices,setLivePrices]=useState({});
 
   // Live mark-to-market: poll the last-traded price for every pair with an
-  // open position (every 60s, plus immediately whenever the open-position
-  // set changes) so Equity can reflect unrealized P/L instead of just
-  // mirroring Balance. This never touches account.balance/equity in
-  // state — those stay server-authoritative, updated only when a position
-  // actually closes (checkExits / paper-exit-check).
-  const openPairsKey=(account.openPositions||[]).map(p=>p.pair).sort().join(',');
+  // open position, plus every pair with a live (non-rejected) signal on
+  // the Signal Desk (every 60s, plus immediately whenever that pair set
+  // changes) so both Equity and the Signal Desk's Current Price field
+  // reflect the real market instead of a stale/absent value. This never
+  // touches account.balance/equity in state — those stay server-
+  // authoritative, updated only when a position actually closes
+  // (checkExits / paper-exit-check).
+  const livePairSet=[...new Set([
+    ...(account.openPositions||[]).map(p=>p.pair),
+    ...signals.filter(s=>s.status!=='Rejected').map(s=>s.pair)
+  ])].filter(Boolean);
+  const openPairsKey=livePairSet.sort().join(',');
   useEffect(()=>{
-    const pairs=[...new Set((account.openPositions||[]).map(p=>p.pair))];
+    const pairs=[...new Set(livePairSet)];
     if(!pairs.length)return;
     let cancelled=false;
     const fetchAll=async()=>{
@@ -3157,7 +3173,7 @@ function App(){
 
   const SCREENS={
     dashboard:e(Dashboard,{account,setAccount,signals,strategies,showToast,setScreen,liveEquity,unrealizedTotal}),
-    signals:e(SignalDesk,{signals,setSignals,account,setAccount,showToast,riskSettings,refreshSignals,signalsLoading}),
+    signals:e(SignalDesk,{signals,setSignals,account,setAccount,showToast,riskSettings,refreshSignals,signalsLoading,livePrices}),
     evolution:e(EvolutionLab,{showToast}),
     portfolio:e(Portfolio,{account,setAccount,showToast,liveEquity,unrealizedTotal,livePrices}),
     more:e(MoreMenu,{setSubScreen:(id)=>{setSubScreen(id);}}),
