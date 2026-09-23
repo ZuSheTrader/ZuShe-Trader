@@ -1012,13 +1012,13 @@ function PaperEngineCard({account,setAccount,showToast}){
 // ═══════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════
-function Dashboard({account,setAccount,signals,strategies,showToast,setScreen}){
+function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,liveEquity,unrealizedTotal}){
   const mkts=useMemo(()=>MARKETS.map(m=>({...m,ch:pchg(m.price,m.prev)})),[]);
   const openCount=account.openPositions.length;
   const activeStrats=strategies.filter(s=>s.status==='Demo Active').length;
   const pendingSigs=signals.filter(s=>s.status==='Pending').length;
-  const equity=account.balance;
-  const equityData=[1000,1005,998,1012,1008,1020,1015,1028,1019,1032,1025,account.balance];
+  const equity=liveEquity!=null?liveEquity:account.balance;
+  const equityData=[1000,1005,998,1012,1008,1020,1015,1028,1019,1032,1025,equity];
   const totalReturn=((account.balance-1000)/1000*100);
 
   return e('div',{className:'screen'},
@@ -1094,7 +1094,9 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen}){
           e('div',{style:{textAlign:'right'}},
             e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,color:'var(--cyan)',fontSize:15}},fmtCur(equity)),
             e('div',{style:{fontSize:10,color:totalReturn>=0?'var(--green)':'var(--red)'}},
-              (totalReturn>=0?'▲ +':'▼ ')+Math.abs(totalReturn).toFixed(2)+'% from start')
+              (totalReturn>=0?'▲ +':'▼ ')+Math.abs(totalReturn).toFixed(2)+'% from start'),
+            openCount>0&&unrealizedTotal!=null&&e('div',{style:{fontSize:10,color:unrealizedTotal>=0?'var(--green)':'var(--red)',marginTop:1}},
+              (unrealizedTotal>=0?'+':'')+fmtCur(unrealizedTotal)+' unrealized')
           )
         ),
         e('div',{className:'chart-wrap',style:{height:80}},
@@ -1717,11 +1719,11 @@ function EvolutionLab({strategies,setStrategies,showToast}){
   );
 }
 
-function Portfolio({account,setAccount,showToast}){
+function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,livePrices}){
   const[tab,setTab]=useState('open');
-  const equity=account.balance;
+  const equity=liveEquity!=null?liveEquity:account.balance;
   const totalReturn=((account.balance-1000)/1000*100);
-  const equityData=[1000,1005,998,1012,1008,1020,1015,1028,1019,1032,1025,account.balance];
+  const equityData=[1000,1005,998,1012,1008,1020,1015,1028,1019,1032,1025,equity];
 
   const closePosition=(posId)=>{
     const pos=account.openPositions.find(p=>p.id===posId);
@@ -1842,7 +1844,10 @@ function Portfolio({account,setAccount,showToast}){
               e('div',{className:'empty-title'},'No open positions'),
               e('div',{className:'empty-sub'},'When you accept a signal from the Signal Desk, a demo position opens here. It will close automatically when it hits the Take Profit or Stop Loss level, or you can close it manually below.')
             )
-          :account.openPositions.map(pos=>e('div',{key:pos.id,className:'card'},
+          :account.openPositions.map(pos=>{
+              const lastPx=livePrices&&livePrices[pos.pair];
+              const uPl=(lastPx&&pos.entry)?(pos.dir==='BUY'?(lastPx-pos.entry):(pos.entry-lastPx))*(pos.size||0):null;
+              return e('div',{key:pos.id,className:'card'},
               e('div',{className:'row',style:{marginBottom:10}},
                 e('div',null,
                   e('div',{style:{display:'flex',alignItems:'center',gap:8,marginBottom:2}},
@@ -1853,7 +1858,8 @@ function Portfolio({account,setAccount,showToast}){
                 ),
                 e('div',{style:{textAlign:'right'}},
                   e('div',{style:{fontSize:10,color:'var(--text3)'}},'At risk'),
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:14,color:'var(--amber)'}},fmtCur(pos.risk))
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:14,color:'var(--amber)'}},fmtCur(pos.risk)),
+                  uPl!=null&&e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:uPl>=0?'var(--green)':'var(--red)',marginTop:2}},(uPl>=0?'+':'')+fmtCur(uPl)+' unrealized')
                 )
               ),
               e('div',{style:{background:'var(--glass)',borderRadius:8,padding:'10px',marginBottom:10}},
@@ -1883,7 +1889,7 @@ function Portfolio({account,setAccount,showToast}){
                 ),
                 e('button',{className:'btn btn-red btn-xs',onClick:()=>closePosition(pos.id)},'Close Now')
               )
-            ))
+            );})
       ),
 
       // Closed trades
@@ -3040,6 +3046,48 @@ function App(){
   const[account,setAccount]=useState(()=>LS.get('za_account',DEMO_ACCOUNT_SEED));
   const[riskSettings,setRiskSettings]=useState(()=>LS.get('za_risk',RISK_SETTINGS_SEED));
   const[showToast,ToastContainer]=useToast();
+  const[livePrices,setLivePrices]=useState({});
+
+  // Live mark-to-market: poll the last-traded price for every pair with an
+  // open position (every 60s, plus immediately whenever the open-position
+  // set changes) so Equity can reflect unrealized P/L instead of just
+  // mirroring Balance. This never touches account.balance/equity in
+  // state — those stay server-authoritative, updated only when a position
+  // actually closes (checkExits / paper-exit-check).
+  const openPairsKey=(account.openPositions||[]).map(p=>p.pair).sort().join(',');
+  useEffect(()=>{
+    const pairs=[...new Set((account.openPositions||[]).map(p=>p.pair))];
+    if(!pairs.length)return;
+    let cancelled=false;
+    const fetchAll=async()=>{
+      const entries=await Promise.all(pairs.map(async pair=>{
+        try{
+          const t=await DataProviders.luno.getTicker(pair);
+          const last=Number(t.last_trade||t.last||0);
+          return [pair,last>0?last:null];
+        }catch(_e){ return [pair,null]; }
+      }));
+      if(cancelled)return;
+      setLivePrices(prev=>{
+        const next={...prev};
+        entries.forEach(([pair,last])=>{ if(last)next[pair]=last; });
+        return next;
+      });
+    };
+    fetchAll();
+    const iv=setInterval(fetchAll,60000);
+    return()=>{cancelled=true;clearInterval(iv);};
+  },[openPairsKey]);
+
+  const unrealizedTotal=useMemo(()=>{
+    return (account.openPositions||[]).reduce((sum,pos)=>{
+      const last=livePrices[pos.pair];
+      if(!last||!pos.entry)return sum;
+      const pl=(pos.dir==='BUY'?(last-pos.entry):(pos.entry-last))*(pos.size||0);
+      return sum+pl;
+    },0);
+  },[account.openPositions,livePrices]);
+  const liveEquity=parseFloat((account.balance+unrealizedTotal).toFixed(2));
 
   // Persist state
   useEffect(()=>{LS.set('za_signals',signals);},[signals]);
@@ -3116,10 +3164,10 @@ function App(){
   };
 
   const SCREENS={
-    dashboard:e(Dashboard,{account,setAccount,signals,strategies,showToast,setScreen}),
+    dashboard:e(Dashboard,{account,setAccount,signals,strategies,showToast,setScreen,liveEquity,unrealizedTotal}),
     signals:e(SignalDesk,{signals,setSignals,account,setAccount,showToast,riskSettings,refreshSignals,signalsLoading}),
     evolution:e(EvolutionLab,{strategies,setStrategies,showToast}),
-    portfolio:e(Portfolio,{account,setAccount,showToast}),
+    portfolio:e(Portfolio,{account,setAccount,showToast,liveEquity,unrealizedTotal,livePrices}),
     more:e(MoreMenu,{setSubScreen:(id)=>{setSubScreen(id);}}),
   };
 
