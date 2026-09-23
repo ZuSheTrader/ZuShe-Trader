@@ -1411,62 +1411,111 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   );
 }
 
-function EvolutionLab({strategies,setStrategies,showToast}){
+function EvolutionLab({showToast}){
   const[tab,setTab]=useState('strategies');
+  const[pool,setPool]=useState([]);
+  const[evoAccount,setEvoAccount]=useState(null);
+  const[evoTrades,setEvoTrades]=useState([]);
+  const[poolLoading,setPoolLoading]=useState(false);
+  const[evoLivePrice,setEvoLivePrice]=useState(null);
   const[running,setRunning]=useState(false);
-  const[evoState,setEvoState]=useState(null);
-  const[settings,setSettings]=useState({market:'XAUUSD',tf:'H4',family:'Trend Following',count:100,minTrades:30,maxDD:15,minPF:1.3,minWR:50});
-  const families=['Trend Following','Moving Average Crossover','RSI Reversal','MACD Momentum','Breakout','Mean Reversion','Volatility Breakout','Support & Resistance','Multi-Indicator','Hybrid AI'];
+  const[runResult,setRunResult]=useState(null);
 
-  const runEvolution=async()=>{
-    setRunning(true);
-    setEvoState({stage:1,gen1Total:settings.count,gen1Pass:0,gen2Total:0,gen2Pass:0,final:0,status:'Creating '+settings.count+' random strategy variations...'});
-    await new Promise(r=>setTimeout(r,900));
-    const pass1=Math.floor(settings.count*(.12+Math.random()*.08));
-    setEvoState(s=>({...s,gen1Pass:pass1,stage:2,status:'Backtesting all strategies on historical price data...'}));
-    await new Promise(r=>setTimeout(r,1100));
-    const mut=pass1*4;
-    setEvoState(s=>({...s,gen2Total:mut,stage:3,status:'Breeding '+mut+' new variations from the '+pass1+' survivors...'}));
-    await new Promise(r=>setTimeout(r,900));
-    const final=Math.floor(mut*(.04+Math.random()*.04));
-    setEvoState(s=>({...s,gen2Pass:Math.floor(mut*.15),gen2Total:mut,final,stage:4,status:'Running overfitting checks and final scoring...'}));
-    await new Promise(r=>setTimeout(r,800));
-    setEvoState(s=>({...s,stage:5,status:final+' strategies passed all filters and are ready to forward test on live data.'}));
-    const newStrats=Array.from({length:Math.min(final,3)},(_,i)=>{
-      const score=Math.floor(50+Math.random()*35);
-      return{id:'s_'+Date.now()+'_'+i,name:settings.family+' α'+(i+1),family:settings.family,version:'v1.0',score,status:'Backtest Passed',winRate:Math.floor(48+Math.random()*20),pf:parseFloat((1.2+Math.random()*.8).toFixed(2)),dd:parseFloat((5+Math.random()*15).toFixed(1)),trades:settings.minTrades+Math.floor(Math.random()*60),tf:settings.tf,market:settings.market};
-    });
-    setStrategies(ss=>[...newStrats,...ss]);
-    setRunning(false);
-    showToast(final+' new strategies discovered — go to Forward Testing to validate them','success');
+  const loadReal=useCallback(async()=>{
+    if(!window.ZuShePaperDB)return;
+    setPoolLoading(true);
+    try{
+      const[p,a,t]=await Promise.all([
+        window.ZuShePaperDB.loadStrategyPool(),
+        window.ZuShePaperDB.loadEvolutionAccount(),
+        window.ZuShePaperDB.loadEvolutionTrades()
+      ]);
+      setPool(p||[]); setEvoAccount(a||null); setEvoTrades(t||[]);
+    }catch(err){
+      console.warn('[ZuShé Trader] could not load evolution data:',err);
+    }finally{
+      setPoolLoading(false);
+    }
+  },[]);
+
+  useEffect(()=>{
+    let cancelled=false,tries=0;
+    const iv=setInterval(()=>{
+      tries++;
+      if(cancelled)return;
+      if(window.ZuShePaperDB||tries>20){
+        clearInterval(iv);
+        loadReal();
+      }
+    },150);
+    return()=>{cancelled=true;clearInterval(iv);};
+  },[loadReal]);
+
+  // The evolution account only ever trades XBTZAR, so a single ticker
+  // poll covers every open position it could be holding.
+  useEffect(()=>{
+    const hasOpen=evoTrades.some(t=>t.status==='OPEN');
+    if(!hasOpen)return;
+    let cancelled=false;
+    const poll=async()=>{
+      try{
+        const t=await DataProviders.luno.getTicker('XBTZAR');
+        const last=Number(t.last_trade||t.last||0);
+        if(!cancelled&&last>0)setEvoLivePrice(last);
+      }catch(_e){/* keep last known price on a transient failure */}
+    };
+    poll();
+    const iv=setInterval(poll,60000);
+    return()=>{cancelled=true;clearInterval(iv);};
+  },[evoTrades]);
+
+  const openByStrategy=useMemo(()=>{
+    const m={};
+    evoTrades.filter(t=>t.status==='OPEN').forEach(t=>{m[t.strategy]=t;});
+    return m;
+  },[evoTrades]);
+
+  const evoUnrealized=useMemo(()=>{
+    return evoTrades.filter(t=>t.status==='OPEN').reduce((sum,t)=>{
+      if(!evoLivePrice||!t.entry_price)return sum;
+      const pl=(t.direction==='BUY'?(evoLivePrice-t.entry_price):(t.entry_price-evoLivePrice))*Number(t.quantity||0);
+      return sum+pl;
+    },0);
+  },[evoTrades,evoLivePrice]);
+
+  const evoEquity=evoAccount?Number(evoAccount.balance)+evoUnrealized:null;
+  const evoReturn=evoAccount?((Number(evoAccount.balance)-Number(evoAccount.starting_balance||10000))/Number(evoAccount.starting_balance||10000)*100):0;
+
+  const runEvolutionNow=async()=>{
+    setRunning(true); setRunResult(null);
+    try{
+      const res=await window.ZuShePaperDB.runEvolutionEngine();
+      setRunResult(res);
+      // The edge function's own placeholder is the literal string 'no'
+      // (not null/empty) when nothing was skipped — only treat it as a
+      // real skip reason otherwise.
+      const realSkip=res.skipped&&res.skipped!=='no'?res.skipped:null;
+      const msg=realSkip?('Cycle ran — '+realSkip)
+        :res.evolved?('Evolved: retired '+res.evolved.retired+', spawned '+(res.evolved.spawned||'a new genome')+' from '+res.evolved.spawnedFrom)
+        :(res.opened&&res.opened.length)?(res.opened.length+' new position(s) opened')
+        :'Cycle complete, no changes this run';
+      showToast(msg,'success');
+      await loadReal();
+    }catch(err){
+      showToast('Evolution run failed: '+(err?.message||'unknown error'),'error');
+    }finally{
+      setRunning(false);
+    }
   };
 
-  const STAGE_INFO=[
-    {lbl:'Generate Variations',desc:'The engine creates '+settings.count+' random trading rule combinations — different indicator settings, stop losses, take profits, and filters. Think of these as candidate strategies, most of which will be eliminated.'},
-    {lbl:'Backtest on History',desc:'Every candidate strategy is tested against months of past price data to see how it would have performed. This filters out strategies that clearly do not work.'},
-    {lbl:'Breed the Survivors',desc:'The strategies that passed backtesting are the "parents". The engine mutates their settings (slightly adjusting indicators, thresholds, risk levels) to create a new generation of improved children.'},
-    {lbl:'Score & Filter',desc:'Every surviving strategy is scored on win rate, profit factor, drawdown, consistency, and overfitting risk. Strategies that look too good to be true (overfit to past data) are rejected here.'},
-    {lbl:'Send to Forward Testing',desc:'The final qualifying strategies are marked "Backtest Passed" and sent to Forward Testing — where they will be tested on fresh data the engine has not seen before.'},
-  ];
-
-  const FAMILY_INFO={
-    'Trend Following':'Buys when price is trending up, sells when trending down. Uses moving averages to define the trend direction.',
-    'Moving Average Crossover':'Signals when a fast moving average crosses above/below a slow one — a classic momentum indicator.',
-    'RSI Reversal':'Looks for overbought/oversold conditions using the Relative Strength Index. Trades reversals, not trends.',
-    'MACD Momentum':'Uses MACD line crossovers and histogram direction to detect momentum shifts.',
-    'Breakout':'Trades when price breaks through a key level of support or resistance with strong volume.',
-    'Mean Reversion':'Assumes price always returns to average. Buys when price is unusually low, sells when unusually high.',
-    'Volatility Breakout':'Trades explosive moves using ATR (Average True Range) as a volatility filter.',
-    'Support & Resistance':'Identifies price levels where markets tend to bounce or break, and trades those reactions.',
-    'Multi-Indicator':'Combines multiple indicators that must all agree before a signal is generated — higher accuracy, fewer signals.',
-    'Hybrid AI':'Combines traditional technical analysis with AI-generated pattern recognition and sentiment weighting.',
-  };
+  const activeCount=pool.filter(g=>g.status==='active').length;
+  const readyCount=pool.filter(g=>g.status==='active'&&g.trades_closed>=15).length;
 
   return e('div',{className:'screen'},
     e('div',{className:'hdr'},
       e('div',null,
         e('div',{style:{fontSize:16,fontWeight:800}},e('span',{style:{color:'var(--cyan)'}},'>_ '),'Evolution Engine'),
-        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,marginTop:1}},'GENERATE · TEST · EVOLVE · DEPLOY')
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,marginTop:1}},'YOUR REAL AUTONOMOUS STRATEGY POOL')
       )
     ),
     e('div',{className:'scroll'},
@@ -1476,204 +1525,127 @@ function EvolutionLab({strategies,setStrategies,showToast}){
         )
       ),
 
-      // ── STRATEGIES TAB ──
+      // ── STRATEGIES TAB (real trader_strategy_pool data) ──
       tab==='strategies'&&e('div',null,
         e('div',{className:'info-banner',style:{marginTop:4}},
           e('span',null,'🧬'),
           e('div',null,
             e('div',{style:{fontWeight:700,marginBottom:2}},'What is a Strategy?'),
-            'A strategy is a set of rules that tells the AI when to buy, sell, set a stop loss, and take profit on a specific market. Each strategy has been backtested and scored. Only strategies marked "Demo Active" are generating live signals.'
+            'These are the actual genomes your evolution engine is running server-side, on their own R10,000 sandbox account, against live BTC/ZAR data — separate from your R1,000 demo account. A genome needs 15 closed trades before it can be retired or bred.'
           )
         ),
-        strategies.length===0
-          ?e('div',{className:'empty'},e('div',{className:'empty-icon'},'🧬'),e('div',{className:'empty-title'},'No strategies yet'),e('div',{className:'empty-sub'},'Go to "Run Evolution" to generate your first strategies.'))
-          :strategies.map(s=>e('div',{key:s.id,className:'strat-card'},
-            e('div',{className:'row',style:{marginBottom:6}},
-              e('div',null,
-                e('div',{style:{fontWeight:700,fontSize:14}},s.name),
-                e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2}},s.family+' · '+s.tf+' chart · '+s.market)
-              ),
-              e('div',{style:{background:scoreColor(s.score)+'18',color:scoreColor(s.score),border:'1px solid '+scoreColor(s.score)+'40',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,fontFamily:'var(--mono)',flexShrink:0}},s.score+'/100 — '+scoreLabel(s.score))
+
+        evoAccount&&e('div',{className:'card',style:{marginBottom:14}},
+          e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:10}},'EVOLUTION ACCOUNT — SEPARATE FROM YOURS'),
+          e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}},
+            e('div',null,
+              e(HelpLabel,{label:'Equity',help:'Starting balance plus or minus unrealized P/L on any open positions, live.'}),
+              e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:15,color:'var(--cyan)',marginTop:2}},fmtCur(evoEquity!=null?evoEquity:Number(evoAccount.balance))),
+              e('div',{style:{fontSize:10,color:evoReturn>=0?'var(--green)':'var(--red)',marginTop:1}},(evoReturn>=0?'▲ +':'▼ ')+Math.abs(evoReturn).toFixed(2)+'% from start')
             ),
-            e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:6,marginBottom:10}},
-              ...[
-                {l:'Win Rate',v:s.winRate+'%',c:'var(--green)',tip:'Out of every 100 trades this strategy took in backtesting, '+s.winRate+' were profitable.'},
-                {l:'Profit Factor',v:s.pf.toFixed(2),c:'var(--cyan)',tip:'Total profits divided by total losses. Above 1.5 is good. Above 2.0 is strong. This strategy made '+s.pf.toFixed(2)+'x more than it lost.'},
-                {l:'Max Drawdown',v:s.dd.toFixed(1)+'%',c:'var(--red)',tip:'The largest peak-to-valley loss this strategy experienced during testing. Lower is safer. This strategy dropped at most '+s.dd.toFixed(1)+'% from its peak.'},
-                {l:'Total Trades',v:s.trades,c:'var(--text2)',tip:'How many trades this strategy took during the backtest period. More trades = more statistical reliability.'},
-              ].map(({l,v,c,tip})=>
-                e('div',{key:l,style:{background:'var(--glass)',borderRadius:8,padding:'6px 8px',textAlign:'center'}},
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:c}},v),
-                  e(HelpLabel,{label:l,help:tip,color:'var(--text3)'})
-                )
-              )
-            ),
-            e('div',{className:'row'},
-              e('div',null,
-                e('span',{className:'live-dot',style:{background:statusColor(s.status)}}),
-                e('span',{style:{fontSize:11,color:statusColor(s.status),fontWeight:700}},s.status),
-                e('span',{style:{fontSize:10,color:'var(--text3)',marginLeft:6}},{
-                  'Demo Active':'— Currently generating live signals',
-                  'Forward Testing':'— Being validated on fresh data',
-                  'Backtest Passed':'— Ready to start forward testing',
-                  'Needs Testing':'— Run a backtest first',
-                  'Retired':'— No longer in use',
-                }[s.status]||'')
-              ),
-              e('span',{style:{fontSize:10,color:'var(--text3)',fontFamily:'var(--mono)'}},s.version)
+            e('div',null,
+              e(HelpLabel,{label:'Open Positions',help:'How many genomes currently have a live BTC/ZAR paper position open.'}),
+              e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:15,marginTop:2}},evoTrades.filter(t=>t.status==='OPEN').length),
+              evoUnrealized!==0&&e('div',{style:{fontSize:10,color:evoUnrealized>=0?'var(--green)':'var(--red)',marginTop:1}},(evoUnrealized>=0?'+':'')+fmtCur(evoUnrealized)+' unrealized')
             )
-          ))
+          )
+        ),
+
+        poolLoading&&pool.length===0
+          ?e('div',{className:'empty'},e('div',{className:'spinner'}),e('div',{className:'empty-sub',style:{marginTop:8}},'Loading your real strategy pool from Supabase…'))
+          :pool.length===0
+          ?e('div',{className:'empty'},e('div',{className:'empty-icon'},'🧬'),e('div',{className:'empty-title'},'No strategies found'),e('div',{className:'empty-sub'},'Could not reach the evolution account — check your connection, or go to "Run Evolution" to trigger a cycle.'))
+          :pool.map(g=>{
+              const openTrade=openByStrategy[g.name];
+              const tradePl=openTrade&&evoLivePrice&&openTrade.entry_price
+                ?(openTrade.direction==='BUY'?(evoLivePrice-openTrade.entry_price):(openTrade.entry_price-evoLivePrice))*Number(openTrade.quantity||0)
+                :null;
+              const fit=Number(g.score||0);
+              const fitColor=fit>=0.8?'var(--green)':fit>=0.4?'var(--amber)':g.trades_closed>0?'var(--red)':'var(--text3)';
+              return e('div',{key:g.id,className:'strat-card'},
+                e('div',{className:'row',style:{marginBottom:6}},
+                  e('div',null,
+                    e('div',{style:{fontWeight:700,fontSize:14}},g.name),
+                    e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2}},g.family+' · Gen '+g.generation+' · BTC/ZAR · H1')
+                  ),
+                  e('div',{style:{background:fitColor+'18',color:fitColor,border:'1px solid '+fitColor+'40',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,fontFamily:'var(--mono)',flexShrink:0}},
+                    g.trades_closed>=15?('Fitness '+fit.toFixed(2)):(g.trades_closed+'/15 trades'))
+                ),
+                e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:6,marginBottom:10}},
+                  ...[
+                    {l:'Win Rate',v:(g.win_rate||0)+'%',c:'var(--green)',tip:'Of the '+g.trades_closed+' real closed trades this genome has taken, '+(g.win_rate||0)+'% were profitable.'},
+                    {l:'Avg R:R',v:(g.avg_rr||0).toFixed(2),c:'var(--cyan)',tip:'Average win size divided by average loss size, across this genome real closed trades.'},
+                    {l:'Net P/L',v:fmtCur(g.net_pnl||0),c:(g.net_pnl||0)>=0?'var(--green)':'var(--red)',tip:'Total realized profit or loss from this genome real closed trades on the R10,000 evolution account.'},
+                    {l:'Trades Closed',v:g.trades_closed||0,c:'var(--text2)',tip:'How many real trades this genome has actually completed. Needs 15 before it can be scored, retired, or bred from.'},
+                  ].map(({l,v,c,tip})=>
+                    e('div',{key:l,style:{background:'var(--glass)',borderRadius:8,padding:'6px 8px',textAlign:'center'}},
+                      e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:c}},v),
+                      e(HelpLabel,{label:l,help:tip,color:'var(--text3)'})
+                    )
+                  )
+                ),
+                openTrade&&e('div',{style:{background:'var(--glass)',borderRadius:8,padding:'8px 10px',marginBottom:10,display:'flex',justifyContent:'space-between',alignItems:'center'}},
+                  e('div',null,
+                    e('span',{className:'pill '+(openTrade.direction==='BUY'?'pill-buy':'pill-sell')},openTrade.direction==='BUY'?'▲ BUY':'▼ SELL'),
+                    e('span',{style:{fontSize:10,color:'var(--text3)',marginLeft:6}},'open now at '+fmtCur(openTrade.entry_price))
+                  ),
+                  tradePl!=null&&e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:tradePl>=0?'var(--green)':'var(--red)'}},(tradePl>=0?'+':'')+fmtCur(tradePl))
+                ),
+                e('div',{className:'row'},
+                  e('div',null,
+                    e('span',{className:'live-dot',style:{background:g.status==='active'?'var(--green)':'var(--red)'}}),
+                    e('span',{style:{fontSize:11,color:g.status==='active'?'var(--green)':'var(--red)',fontWeight:700,textTransform:'capitalize'}},g.status),
+                    e('span',{style:{fontSize:10,color:'var(--text3)',marginLeft:6}},g.status==='active'?'— competing in the live pool':'— retired '+(g.retired_at?new Date(g.retired_at).toLocaleDateString():''))
+                  ),
+                  g.parent_id&&e('span',{style:{fontSize:10,color:'var(--text3)',fontFamily:'var(--mono)'}},'bred from parent')
+                ),
+                g.notes&&e('div',{style:{fontSize:10,color:'var(--text3)',marginTop:8,lineHeight:1.5,fontStyle:'italic'}},g.notes)
+              );
+            }),
+
+        activeCount>0&&e('div',{style:{fontSize:10,color:'var(--text3)',textAlign:'center',marginTop:4}},
+          readyCount+' of '+activeCount+' active genomes have reached 15 closed trades — evolution (retire weakest, breed from best) happens automatically once all of them do.')
       ),
 
-      // ── RUN EVOLUTION TAB ──
+      // ── RUN EVOLUTION TAB (triggers the real edge function) ──
       tab==='run'&&e('div',null,
-        !running&&!evoState&&e('div',null,
-          e('div',{className:'info-banner',style:{marginTop:4}},
-            e('span',null,'🧬'),
-            e('div',null,
-              e('div',{style:{fontWeight:700,marginBottom:2}},'How does the Evolution Engine work?'),
-              'It creates hundreds of random trading strategies, tests each one on historical price data, eliminates the weak ones, then breeds improved variations from the survivors — like natural selection for trading rules. The strongest strategies are sent to Forward Testing where they are validated on data the engine has never seen.'
-            )
-          ),
-          e('div',{className:'card'},
-            e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:14}},'CONFIGURE YOUR EVOLUTION RUN'),
-            e('div',{style:{marginBottom:12}},
-              e('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:4}},
-                e('div',{className:'inp-lbl'},'Market to Trade'),
-                e('span',{style:{fontSize:10,color:'var(--text3)'}},'Which market should strategies be built for?')
-              ),
-              e('select',{className:'inp',value:settings.market,onChange:ev=>setSettings(s=>({...s,market:ev.target.value}))},
-                MARKETS.map(m=>e('option',{key:m.id,value:m.id},m.name+' — '+m.label))
-              )
-            ),
-            e('div',{style:{marginBottom:12}},
-              e('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:4}},
-                e('div',{className:'inp-lbl'},'Chart Timeframe'),
-                e('span',{style:{fontSize:10,color:'var(--text3)'}},'M15=15min · H1=1hr · H4=4hr · D1=daily')
-              ),
-              e('select',{className:'inp',value:settings.tf,onChange:ev=>setSettings(s=>({...s,tf:ev.target.value}))},
-                [['M15','M15 — 15 Minute (scalping, many signals)'],['H1','H1 — 1 Hour (intraday, balanced)'],['H4','H4 — 4 Hour (swing, higher quality)'],['D1','D1 — Daily (position trading, most reliable)']].map(([v,l])=>e('option',{key:v,value:v},l))
-              )
-            ),
-            e('div',{style:{marginBottom:12}},
-              e('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:4}},
-                e('div',{className:'inp-lbl'},'Strategy Family / Type'),
-                e('span',{style:{fontSize:10,color:'var(--text3)'}},'The logic style of strategies to generate')
-              ),
-              e('select',{className:'inp',value:settings.family,onChange:ev=>setSettings(s=>({...s,family:ev.target.value}))},
-                families.map(f=>e('option',{key:f,value:f},f))
-              ),
-              settings.family&&FAMILY_INFO[settings.family]&&e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:6,padding:'8px 10px',background:'var(--glass)',borderRadius:8,lineHeight:1.6}},
-                '💡 ',FAMILY_INFO[settings.family]
-              )
-            ),
-            e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:12}},
-              e('div',null,
-                e('div',{style:{fontSize:10,color:'var(--text3)',marginBottom:4,fontFamily:'var(--mono)',letterSpacing:1}},'VARIATIONS TO CREATE'),
-                e('input',{className:'inp',type:'number',value:settings.count,onChange:ev=>setSettings(s=>({...s,count:parseInt(ev.target.value)||100}))}),
-                e('div',{style:{fontSize:10,color:'var(--text3)',marginTop:4}},'More = broader search, slower run')
-              ),
-              e('div',null,
-                e('div',{style:{fontSize:10,color:'var(--text3)',marginBottom:4,fontFamily:'var(--mono)',letterSpacing:1}},'MIN TRADES REQUIRED'),
-                e('input',{className:'inp',type:'number',value:settings.minTrades,onChange:ev=>setSettings(s=>({...s,minTrades:parseInt(ev.target.value)||30}))}),
-                e('div',{style:{fontSize:10,color:'var(--text3)',marginTop:4}},'Fewer trades = unreliable data')
-              )
-            ),
-            e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--amber)',letterSpacing:1.5,marginBottom:8}},'SURVIVAL FILTERS — strategies failing these are eliminated'),
-            e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,marginBottom:14}},
-              ...[
-                {k:'minWR',l:'Min Win Rate %',tip:'Reject strategies winning less than this % of trades'},
-                {k:'minPF',l:'Min Profit Factor',tip:'Reject strategies where profits / losses ratio is below this'},
-                {k:'maxDD',l:'Max Drawdown %',tip:'Reject strategies that dropped more than this % from peak'},
-              ].map(({k,l,tip})=>e('div',{key:k},
-                e('div',{style:{fontSize:9,color:'var(--text3)',marginBottom:4,lineHeight:1.4}},l),
-                e('input',{className:'inp',type:'number',step:k==='minPF'?.1:1,value:settings[k],onChange:ev=>setSettings(s=>({...s,[k]:parseFloat(ev.target.value)||0}))}),
-                e('div',{style:{fontSize:9,color:'var(--text3)',marginTop:3,lineHeight:1.4,fontStyle:'italic'}},tip)
-              ))
-            ),
-            e('button',{className:'btn btn-primary',onClick:runEvolution},'🧬 Start Evolution Run')
+        e('div',{className:'info-banner',style:{marginTop:4}},
+          e('span',null,'🧬'),
+          e('div',null,
+            e('div',{style:{fontWeight:700,marginBottom:2}},'How the real Evolution Engine works'),
+            'Unlike a configurable simulator, this is the actual server-side process: a fixed pool of genomes competes on real BTC/ZAR 1H data on their own R10,000 account. It already runs automatically on a schedule — this button just triggers one cycle immediately so you can see the result right now. Each cycle updates every genome real stats, retires the weakest and breeds a new one from the best once all active genomes have 15+ closed trades, then checks for a fresh entry.'
           )
         ),
 
-        (running||evoState)&&e('div',null,
-          e('div',{className:'card'},
-            e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:14}},'EVOLUTION IN PROGRESS'),
-            evoState&&e('div',{style:{marginBottom:16}},
-              e('div',{style:{fontSize:13,color:'var(--text)',fontWeight:600,marginBottom:12,lineHeight:1.5}},evoState.status),
-
-              // Stats grid with explanations
-              e('div',{style:{background:'var(--glass)',borderRadius:10,padding:'12px',display:'flex',flexDirection:'column',gap:8}},
-
-                e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}},
-                  e('div',null,
-                    e('div',{style:{fontSize:12,fontWeight:700,color:'var(--text2)'}},'Generation 1 — Candidates'),
-                    e('div',{style:{fontSize:10,color:'var(--text3)',marginTop:2}},
-                      evoState.gen1Total+' random strategy variations were created and tested on historical '+settings.market+' '+settings.tf+' price data.'
-                    )
-                  ),
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:20,color:'var(--cyan)',flexShrink:0}},evoState.gen1Total)
-                ),
-
-                evoState.gen1Pass>0&&e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',borderTop:'1px solid var(--border)',paddingTop:8}},
-                  e('div',null,
-                    e('div',{style:{fontSize:12,fontWeight:700,color:'var(--green)'}},'✓ Survivors (passed all filters)'),
-                    e('div',{style:{fontSize:10,color:'var(--text3)',marginTop:2}},
-                      'Only '+evoState.gen1Pass+' out of '+evoState.gen1Total+' strategies met your minimum win rate ('+settings.minWR+'%), profit factor ('+settings.minPF+'), and drawdown ('+settings.maxDD+'%) requirements. The other '+(evoState.gen1Total-evoState.gen1Pass)+' were discarded.'
-                    )
-                  ),
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:20,color:'var(--green)',flexShrink:0}},evoState.gen1Pass)
-                ),
-
-                evoState.gen2Total>0&&e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',borderTop:'1px solid var(--border)',paddingTop:8}},
-                  e('div',null,
-                    e('div',{style:{fontSize:12,fontWeight:700,color:'var(--amber)'}},'Generation 2 — Bred Variations'),
-                    e('div',{style:{fontSize:10,color:'var(--text3)',marginTop:2}},
-                      'The '+evoState.gen1Pass+' survivors were used as parents. Each had its parameters slightly adjusted (EMA lengths, RSI thresholds, stop distances, etc.) to create '+evoState.gen2Total+' new child variations. Like evolving a species — keeping what works and experimenting further.'
-                    )
-                  ),
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:20,color:'var(--amber)',flexShrink:0}},evoState.gen2Total)
-                ),
-
-                evoState.final>0&&e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',borderTop:'1px solid var(--border)',paddingTop:8}},
-                  e('div',null,
-                    e('div',{style:{fontSize:12,fontWeight:700,color:'var(--purple)'}},'Final Candidates — Ready to Forward Test'),
-                    e('div',{style:{fontSize:10,color:'var(--text3)',marginTop:2}},
-                      evoState.final+' strategies survived all filters including overfitting detection. These will appear in your Strategies tab with status "Backtest Passed". Head to Forward Testing to validate them on fresh price data before deploying to your demo account.'
-                    )
-                  ),
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:20,color:'var(--purple)',flexShrink:0}},evoState.final)
-                )
-              )
-            ),
-
-            // Stage pipeline
-            e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,margin:'14px 0 8px'}},'PIPELINE STAGES'),
-            STAGE_INFO.map((st,i)=>e('div',{key:i,className:'evo-stage'},
-              e('div',{className:'evo-num '+(evoState&&evoState.stage>i+1?'evo-done':evoState&&evoState.stage===i+1?'evo-active':'evo-pending')},
-                evoState&&evoState.stage>i+1?'✓':i+1
+        e('div',{className:'card'},
+          e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:12}},'CURRENT POOL'),
+          pool.length===0
+            ?e('div',{style:{fontSize:12,color:'var(--text3)'}},'Not loaded yet.')
+            :e('div',{style:{fontSize:12,color:'var(--text2)',lineHeight:1.8}},
+                activeCount+' active genome'+(activeCount===1?'':'s')+', '+(pool.length-activeCount)+' retired. '+readyCount+' of '+activeCount+' active ones have reached the 15-trade threshold.'
               ),
-              e('div',{style:{flex:1}},
-                e('div',{className:'evo-lbl',style:{color:evoState&&evoState.stage===i+1?'var(--cyan)':evoState&&evoState.stage>i+1?'var(--green)':'var(--text3)'}},st.lbl),
-                evoState&&evoState.stage===i+1&&e('div',{style:{display:'flex',alignItems:'center',gap:6,marginTop:3}},e('div',{className:'spinner'}),e('span',{style:{fontSize:11,color:'var(--text3)'}},evoState.status)),
-                e('div',{style:{fontSize:10,color:'var(--text3)',marginTop:2,lineHeight:1.5,display:evoState&&evoState.stage<=i+1?'none':'block'}},st.desc)
-              )
-            )),
-
-            running&&e('div',{style:{marginTop:14}},
-              e('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:4}},
-                e('span',{style:{fontSize:11,color:'var(--text3)'}},'Overall progress'),
-                e('span',{style:{fontSize:11,color:'var(--cyan)',fontFamily:'var(--mono)'}},'Stage '+(evoState?.stage||0)+' of 5')
-              ),
-              e('div',{className:'prog-wrap',style:{height:8}},
-                e('div',{className:'prog-fill prog-cyan',style:{width:Math.min(100,(evoState?.stage||0)/5*100)+'%'}})
-              )
-            ),
-
-            !running&&evoState&&e('div',{style:{marginTop:14,display:'flex',gap:8}},
-              e('button',{className:'btn btn-outline',onClick:()=>setEvoState(null)},'Run Another Evolution'),
-              e('button',{className:'btn btn-ghost',onClick:()=>{setEvoState(null);setTab('strategies');}},'View New Strategies →')
-            )
+          e('button',{className:'btn btn-primary',style:{marginTop:14,width:'100%'},disabled:running,onClick:runEvolutionNow},
+            running?e('span',{style:{display:'flex',alignItems:'center',justifyContent:'center',gap:8}},e('div',{className:'spinner'}),'Running cycle…'):'🧬 Run Evolution Cycle Now'
           )
+        ),
+
+        runResult&&e('div',{className:'card',style:{marginTop:14}},
+          e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--green)',letterSpacing:2,marginBottom:10}},'RESULT OF THIS CYCLE'),
+          runResult.skipped&&runResult.skipped!=='no'&&e('div',{style:{fontSize:12,color:'var(--amber)',lineHeight:1.6}},'⏸️ Skipped: '+runResult.skipped),
+          runResult.evolved&&e('div',{style:{fontSize:12,color:'var(--text2)',lineHeight:1.7,marginBottom:runResult.opened&&runResult.opened.length?10:0}},
+            e('div',{style:{fontWeight:700,color:'var(--amber)',marginBottom:2}},'🧬 Evolution happened'),
+            'Retired ',e('b',null,runResult.evolved.retired),', bred ',e('b',null,runResult.evolved.spawned||'a new genome'),' from ',e('b',null,runResult.evolved.spawnedFrom),'.'
+          ),
+          runResult.opened&&runResult.opened.length>0&&e('div',null,
+            e('div',{style:{fontWeight:700,color:'var(--green)',marginBottom:6,fontSize:12}},'📈 New position(s) opened'),
+            runResult.opened.map((o,i)=>e('div',{key:i,style:{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--text2)',padding:'4px 0',borderTop:i>0?'1px solid var(--border)':'none'}},
+              e('span',null,o.genome+' — '+o.direction),
+              e('span',{style:{fontFamily:'var(--mono)'}},'entry '+fmtCur(o.entry))
+            ))
+          ),
+          (!runResult.skipped||runResult.skipped==='no')&&!runResult.evolved&&(!runResult.opened||runResult.opened.length===0)&&
+            e('div',{style:{fontSize:12,color:'var(--text3)'}},'Stats updated. No evolution and no new entries this cycle — that is normal, most cycles are quiet.'),
+          runResult.error&&e('div',{style:{fontSize:12,color:'var(--red)'}},'Error: '+runResult.error)
         )
       ),
 
@@ -3186,7 +3158,7 @@ function App(){
   const SCREENS={
     dashboard:e(Dashboard,{account,setAccount,signals,strategies,showToast,setScreen,liveEquity,unrealizedTotal}),
     signals:e(SignalDesk,{signals,setSignals,account,setAccount,showToast,riskSettings,refreshSignals,signalsLoading}),
-    evolution:e(EvolutionLab,{strategies,setStrategies,showToast}),
+    evolution:e(EvolutionLab,{showToast}),
     portfolio:e(Portfolio,{account,setAccount,showToast,liveEquity,unrealizedTotal,livePrices}),
     more:e(MoreMenu,{setSubScreen:(id)=>{setSubScreen(id);}}),
   };
@@ -3236,6 +3208,8 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
   const ZS_SUPABASE_KEY = 'sb_publishable_ioF9Qw3xVWKwYIrxhwGy-A_ElWAjXwj';
   const ZS_OWNER_KEY = 'zushé-paper-owner-v1';
   const ZS_SYSTEM_KEY = 'zushé-system-v1'; // must match SYSTEM_FLAGS_KEY in the evolution-engine edge function
+  const ZS_EVOLUTION_KEY = 'zushé-evolution-account-v1'; // must match EVOLUTION_OWNER_KEY in the evolution-engine edge function
+  const ZS_EVOLUTION_ENGINE_URL = ZS_SUPABASE_URL + '/functions/v1/evolution-engine';
   const ZS_PAIR = 'XBTZAR';
   const ZS_TIMEFRAME = 3600;
 
@@ -3414,6 +3388,58 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       .limit(limit);
     if (error) throw error;
     return data || [];
+  }
+
+  // ── Evolution Engine (the REAL one, running server-side) ─────────────
+  // This is a separate R10,000 sandbox account the autonomous evolution-
+  // engine edge function trades on its own, entirely independent of the
+  // user's own paper account above. These three loaders surface that real
+  // data so the Evolution Engine screen stops showing hardcoded demo
+  // strategies that have nothing to do with what's actually running.
+  let zsEvoAccountCache = null;
+
+  async function zsLoadEvolutionAccount(force = false) {
+    const db = zsInitSupabase();
+    if (!db) return null;
+    if (zsEvoAccountCache && !force) return zsEvoAccountCache;
+    const { data, error } = await db.from('trader_paper_accounts').select('*').eq('owner_key', ZS_EVOLUTION_KEY).maybeSingle();
+    if (error) { console.warn('[ZuShé Trader] loadEvolutionAccount failed:', error.message || error); return null; }
+    zsEvoAccountCache = data || null;
+    return zsEvoAccountCache;
+  }
+
+  async function zsLoadStrategyPool() {
+    const db = zsInitSupabase();
+    if (!db) return [];
+    const account = await zsLoadEvolutionAccount();
+    if (!account) return [];
+    const { data, error } = await db.from('trader_strategy_pool').select('*').eq('account_id', account.id)
+      .order('status', { ascending: true }).order('generation', { ascending: false }).order('score', { ascending: false });
+    if (error) { console.warn('[ZuShé Trader] loadStrategyPool failed:', error.message || error); return []; }
+    return data || [];
+  }
+
+  async function zsLoadEvolutionTrades(limit = 50) {
+    const db = zsInitSupabase();
+    if (!db) return [];
+    const account = await zsLoadEvolutionAccount();
+    if (!account) return [];
+    const { data, error } = await db.from('trader_paper_trades').select('*').eq('account_id', account.id)
+      .order('entry_time', { ascending: false }).limit(limit);
+    if (error) { console.warn('[ZuShé Trader] loadEvolutionTrades failed:', error.message || error); return []; }
+    return data || [];
+  }
+
+  // Triggers one real evolution-engine cycle right now (the same function
+  // a server cron already calls periodically) — updates each genome's
+  // stats, retires/spawns if every active genome has enough closed trades,
+  // then checks for a fresh BTC/ZAR entry. Returns the engine's own JSON
+  // report, not a fabricated one.
+  async function zsRunEvolutionEngine() {
+    const r = await fetch(ZS_EVOLUTION_ENGINE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('Evolution engine HTTP ' + r.status));
+    return j;
   }
 
   // Upserts a paper trade (open or closed) into trader_paper_trades.
@@ -3613,7 +3639,11 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     getPushSubscription: zsGetPushSubscription,
     subscribePush: zsSubscribePush,
     unsubscribePush: zsUnsubscribePush,
-    updatePushPrefs: zsUpdatePushPrefs
+    updatePushPrefs: zsUpdatePushPrefs,
+    loadEvolutionAccount: zsLoadEvolutionAccount,
+    loadStrategyPool: zsLoadStrategyPool,
+    loadEvolutionTrades: zsLoadEvolutionTrades,
+    runEvolutionEngine: zsRunEvolutionEngine
   };
 
   window.addEventListener('load', async () => {
