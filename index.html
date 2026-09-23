@@ -1014,7 +1014,7 @@ function PaperEngineCard({account,setAccount,showToast}){
 // ═══════════════════════════════════════════
 function Dashboard({account,setAccount,signals,strategies,showToast,setScreen}){
   const mkts=useMemo(()=>MARKETS.map(m=>({...m,ch:pchg(m.price,m.prev)})),[]);
-  const openCount=(account.openPositions||[]).filter(p=>p.paper).length;
+  const openCount=account.openPositions.length;
   const activeStrats=strategies.filter(s=>s.status==='Demo Active').length;
   const pendingSigs=signals.filter(s=>s.status==='Pending').length;
   const equity=account.balance;
@@ -1205,6 +1205,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   // trader_paper_trades and paper-exit-check will close it against live
   // Luno prices, exactly like a Combined-strategy trade.
   const acceptSig=(sig)=>{
+    if(sig.dir==='NO TRADE'){showToast('This is not a real setup — nothing to accept.','info');return;}
     if(account.openPositions.length>=riskSettings.maxOpenTrades){
       showToast('Max open trades ('+riskSettings.maxOpenTrades+') already reached. Close a position first.','warning');return;
     }
@@ -2781,13 +2782,27 @@ function DataFeedSettings({showToast}){
   );
 }
 
-function AppSettings({showToast,onLogout}){
+function AppSettings({showToast,onLogout,account,setAccount}){
   const[notifs,setNotifs]=useState(false);
   const[sigAlerts,setSigAlerts]=useState(true);
   const[riskAlerts,setRiskAlerts]=useState(true);
   const[evoAlerts,setEvoAlerts]=useState(true);
   const[newSigAlerts,setNewSigAlerts]=useState(true);
   const[pushBusy,setPushBusy]=useState(false);
+  const[resetConfirm,setResetConfirm]=useState(false);
+
+  // Clears the local Dashboard "paper engine" (localStorage-based, separate
+  // from the Supabase-backed Signal Desk) — mainly for wiping out the
+  // degenerate "NO TRADE" ghost positions/closed trades a past bug could
+  // have left behind in account.openPositions / account.closedTrades.
+  // Does not touch Supabase (trader_signals / trader_paper_trades).
+  function resetLocalPaperEngine(){
+    if(!resetConfirm){ setResetConfirm(true); return; }
+    paperReset();
+    setAccount&&setAccount(a=>({...DEMO_ACCOUNT_SEED,balance:a?.balance||DEMO_ACCOUNT_SEED.balance}));
+    setResetConfirm(false);
+    showToast('Local paper engine data cleared','success');
+  }
 
   useEffect(()=>{
     let cancelled=false;
@@ -2924,6 +2939,18 @@ function AppSettings({showToast,onLogout}){
         ))
       ),
 
+      // Local data
+      e('div',{className:'settings-section'},
+        e('div',{className:'settings-hdr'},'Local Data'),
+        e('div',{className:'settings-row'},
+          e('div',{style:{flex:1}},
+            e('div',{className:'settings-lbl'},'Reset Local Paper Engine'),
+            e('div',{className:'settings-sub'},'Clears the on-device demo positions/closed trades stored in this browser only — use this if you ever see stray "NO TRADE" entries in Portfolio. Does not touch your Supabase data or the Signal Desk.')
+          ),
+          e('button',{className:'btn '+(resetConfirm?'btn-red':'btn-ghost'),style:{whiteSpace:'nowrap'},onClick:resetLocalPaperEngine},resetConfirm?'Tap to confirm':'Reset')
+        )
+      ),
+
       // About the system
       e('div',{className:'settings-section'},
         e('div',{className:'settings-hdr'},'About ZuShé Trader'),
@@ -3020,90 +3047,23 @@ function App(){
   useEffect(()=>{LS.set('za_account',account);},[account]);
   useEffect(()=>{LS.set('za_risk',riskSettings);},[riskSettings]);
 
-  // Supabase is the authoritative source for paper-trade state.
-  // On startup, mirror the server paper ledger into the UI so Portfolio
-  // remains correct after refreshes, browser restarts, and new sessions.
+  // One-time bootstrap: adopt the Supabase paper account balance if one
+  // already exists there and differs from a fresh R1,000 start — otherwise
+  // the Paper Engine's real trade history silently diverges from what this
+  // screen shows after a reload on a different device/session.
   useEffect(()=>{
     let cancelled=false;
     (async()=>{
-      for(let i=0;i<30&&!window.ZuShePaperDB;i++){
-        await new Promise(r=>setTimeout(r,150));
-      }
+      for(let i=0;i<20&&!window.ZuShePaperDB;i++){ await new Promise(r=>setTimeout(r,150)); }
       if(cancelled||!window.ZuShePaperDB)return;
       try{
         const remote=await window.ZuShePaperDB.ensureAccount();
-        const rows=await window.ZuShePaperDB.loadTrades(200);
-        if(cancelled)return;
-
-        const openRows=(rows||[]).filter(t=>String(t.status).toUpperCase()==='OPEN');
-        const closedRows=(rows||[]).filter(t=>String(t.status).toUpperCase()==='CLOSED');
-
-        const remoteBalance=Number(remote?.balance);
-
-        setAccount(a=>{
-          const localClosed=Array.isArray(a.closedTrades)?a.closedTrades:[];
-
-          const openPositions=openRows.map(t=>({
-            id:t.metadata?.local_id || 'PT-'+t.id,
-            dbId:t.id,
-            pair:t.pair,
-            market:t.pair,
-            dir:t.direction,
-            entry:Number(t.entry_price)||0,
-            sl:Number(t.stop_price)||0,
-            tp:Number(t.take_profit)||0,
-            size:Number(t.quantity)||0,
-            risk:Number(t.risk_amount)||0,
-            strategy:t.strategy||'Combined',
-            strat:t.strategy||'Combined',
-            confidence:Number(t.metadata?.confidence||0),
-            openedAt:t.entry_time?new Date(t.entry_time).getTime():Date.now(),
-            openTime:t.entry_time,
-            paper:true,
-            sigId:t.metadata?.signal_id||null
-          }));
-
-          const serverClosed=closedRows.map(t=>({
-            id:t.metadata?.local_id || 'CT-'+t.id,
-            dbId:t.id,
-            pair:t.pair,
-            market:t.pair,
-            dir:t.direction,
-            entry:Number(t.entry_price)||0,
-            sl:Number(t.stop_price)||0,
-            tp:Number(t.take_profit)||0,
-            size:Number(t.quantity)||0,
-            risk:Number(t.risk_amount)||0,
-            strategy:t.strategy||'Combined',
-            strat:t.strategy||'Combined',
-            confidence:Number(t.metadata?.confidence||0),
-            openedAt:t.entry_time?new Date(t.entry_time).getTime():Date.now(),
-            openTime:t.entry_time,
-            exit:Number(t.exit_price)||0,
-            pl:Number(t.net_pnl ?? t.gross_pnl ?? 0),
-            closeTime:t.exit_time,
-            status:Number(t.net_pnl ?? t.gross_pnl ?? 0)>=0?'Win':'Loss',
-            trigger:t.exit_reason,
-            paper:true
-          }));
-
-          const serverIds=new Set(serverClosed.map(t=>t.dbId));
-          const preserved=localClosed.filter(t=>!t.dbId || !serverIds.has(t.dbId));
-          const balance=Number.isFinite(remoteBalance)?remoteBalance:a.balance;
-          const used=openPositions.reduce((sum,t)=>sum+(Number(t.risk)||0),0);
-
-          return {
-            ...a,
-            balance,
-            equity:balance,
-            used:parseFloat(used.toFixed(2)),
-            openPositions,
-            closedTrades:[...serverClosed,...preserved]
-          };
-        });
-      }catch(err){
-        console.warn('[ZuShé Trader] Could not sync Supabase paper trades:',err?.message||err);
-      }
+        if(!remote||cancelled)return;
+        const remoteBalance=Number(remote.balance);
+        if(Number.isFinite(remoteBalance)&&Math.abs(remoteBalance-account.balance)>0.005){
+          setAccount(a=>({...a,balance:remoteBalance,equity:remoteBalance}));
+        }
+      }catch(err){ console.warn('[ZuShé Trader] Could not sync Supabase paper account:',err?.message||err); }
     })();
     return()=>{cancelled=true;};
   },[]);
@@ -3152,7 +3112,7 @@ function App(){
     forward:e(ForwardTest,{strategies,setStrategies,showToast}),
     risk:e(RiskVault,{riskSettings,setRiskSettings,account,showToast}),
     broker:e(BrokerConnection,{showToast}),
-    settings:e(AppSettings,{showToast,onLogout:logout}),
+    settings:e(AppSettings,{showToast,onLogout:logout,account,setAccount}),
   };
 
   const SCREENS={
@@ -3340,11 +3300,19 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
   async function zsSaveSignal(signal) {
     const db = zsInitSupabase();
     if (!db || !signal) return;
+    // Only a real BUY/SELL setup is a signal — a NO TRADE evaluation is the
+    // Dashboard's own "nothing lines up right now" result and must never be
+    // written to trader_signals, or it shows up on the Signal Desk as a
+    // fake pending proposal (0% confidence, blank entry/stop/target) and,
+    // if accidentally accepted, as a degenerate paper position that opens
+    // and instantly "closes" for exactly R0 profit. signal-scan (the
+    // server cron) already enforces this same rule; this mirrors it here.
+    if (signal.direction !== 'BUY' && signal.direction !== 'SELL') return;
     const account = zsAccount || await zsEnsureAccount();
     // The raw signal only carries `price` + `stopDistance`; derive an
     // indicative entry/stop/target here (mirrors the app's own 1:2 R:R
     // model) so these columns are actually populated instead of null.
-    const hasSetup = signal.direction === 'BUY' || signal.direction === 'SELL';
+    const hasSetup = true;
     const price = Number(signal.price || 0);
     const dist = Number(signal.stopDistance || 0);
     const stopPrice = hasSetup ? (signal.direction === 'BUY' ? price - dist : price + dist) : null;
@@ -3438,6 +3406,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     const { data, error } = await db.from('trader_signals')
       .select('*')
       .eq('account_id', account?.id || null)
+      .neq('direction', 'NO TRADE')
       .order('created_at', { ascending: false })
       .limit(100);
     if (error) { console.warn('[ZuShé Trader] loadSignals failed:', error.message || error); return []; }
