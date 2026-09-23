@@ -1205,7 +1205,10 @@ function mapDbSignalToUi(row,account){
     time:row.created_at?new Date(row.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'',
     reasoning:(row.reason||'')+(Array.isArray(row.evidence)&&row.evidence.length?' — '+row.evidence.join('; '):''),
     overfit:null,
-    reason:row.decision_reason||''
+    reason:row.decision_reason||'',
+    source:row.source||'ai_scan',
+    tradable:!(row.source_meta&&row.source_meta.tradable===false),
+    channel:(row.source_meta&&row.source_meta.channel_or_author)||''
   };
 }
 
@@ -1215,10 +1218,49 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   const[rejReason,setRejReason]=useState('');
   const[showDetail,setShowDetail]=useState(null);
 
-  const pending=signals.filter(s=>s.status==='Pending');
-  const accepted=signals.filter(s=>s.status==='Accepted');
-  const rejected=signals.filter(s=>s.status==='Rejected');
-  const watching=signals.filter(s=>s.status==='Watching');
+  const[srcTab,setSrcTab]=useState('all');
+  const[tgLabel,setTgLabel]=useState('');
+  const[tgBusy,setTgBusy]=useState(false);
+  const fileRef=useRef(null);
+  const bySource=srcTab==='all'?signals:signals.filter(s=>(s.source||'ai_scan')===srcTab);
+  const pending=bySource.filter(s=>s.status==='Pending');
+  const accepted=bySource.filter(s=>s.status==='Accepted');
+  const rejected=bySource.filter(s=>s.status==='Rejected');
+  const watching=bySource.filter(s=>s.status==='Watching');
+
+  // Downscale to max 1600px JPEG so phone screenshots stay well under API/body limits.
+  const fileToBase64=(file)=>new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(file);
+    const img=new Image();
+    img.onload=()=>{
+      const maxDim=1600,k=Math.min(1,maxDim/Math.max(img.width,img.height));
+      const c=document.createElement('canvas');
+      c.width=Math.round(img.width*k);c.height=Math.round(img.height*k);
+      c.getContext('2d').drawImage(img,0,0,c.width,c.height);
+      URL.revokeObjectURL(url);
+      resolve({base64:c.toDataURL('image/jpeg',0.85).split(',')[1],mediaType:'image/jpeg'});
+    };
+    img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('Could not read that image.'));};
+    img.src=url;
+  });
+  const onPickTelegram=async(ev)=>{
+    const file=ev.target.files&&ev.target.files[0];
+    ev.target.value='';
+    if(!file)return;
+    if(!window.ZuShePaperDB?.submitTelegramSignal){showToast('Signal parser not ready yet — try again in a moment.','warning');return;}
+    setTgBusy(true);
+    try{
+      const {base64,mediaType}=await fileToBase64(file);
+      const r=await window.ZuShePaperDB.submitTelegramSignal(base64,mediaType,tgLabel.trim()||'telegram');
+      if(r&&r.error){showToast(r.error,'warning');}
+      else{
+        showToast('📨 Screenshot parsed — signal added to Pending','success');
+        setTab('pending');
+        refreshSignals&&refreshSignals();
+      }
+    }catch(err){showToast((err&&err.message)||'Upload failed','warning');}
+    setTgBusy(false);
+  };
 
   useEffect(()=>{ refreshSignals&&refreshSignals(); },[]);
 
@@ -1228,6 +1270,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   // Luno prices, exactly like a Combined-strategy trade.
   const acceptSig=(sig)=>{
     if(sig.dir==='NO TRADE'){showToast('This is not a real setup — nothing to accept.','info');return;}
+    if(sig.tradable===false){showToast(sig.pair+' has no live price feed, so it cannot auto-close as a paper trade. Use Watch Only to track it manually.','info');return;}
     if(account.openPositions.length>=riskSettings.maxOpenTrades){
       showToast('Max open trades ('+riskSettings.maxOpenTrades+') already reached. Close a position first.','warning');return;
     }
@@ -1277,11 +1320,11 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
             e('span',{style:{fontWeight:800,fontSize:16}},sig.market)
           ),
           e('div',{style:{fontSize:11,color:'var(--text3)'}},
-            sig.strat,' · ',sig.tf,' chart · Signal at ',sig.time
+            sig.source==='telegram'?('📨 Telegram'+(sig.channel?' · '+sig.channel:'')+(sig.tradable===false?' · manual track only':'')):(sig.strat+' · '+sig.tf+' chart'),' · Signal at ',sig.time
           )
         ),
         e('div',{style:{textAlign:'right'}},
-          e('div',{style:{fontFamily:'var(--mono)',fontSize:10,color:'var(--cyan)',marginBottom:2}},'AI CONFIDENCE'),
+          e('div',{style:{fontFamily:'var(--mono)',fontSize:10,color:'var(--cyan)',marginBottom:2}},sig.source==='telegram'?'PARSE CONFIDENCE':'AI CONFIDENCE'),
           e('div',{style:{fontFamily:'var(--mono)',fontWeight:800,fontSize:20,color:sig.conf>79?'var(--green)':sig.conf>65?'var(--cyan)':'var(--amber)'}},sig.conf+'%'),
           e('div',{style:{fontSize:9,color:'var(--text3)',marginTop:1}},sig.conf>79?'High confidence':sig.conf>65?'Moderate confidence':'Lower confidence')
         )
@@ -1375,6 +1418,19 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
           'A signal is a trade proposal generated by a background scan of your crypto watchlist (BTC/ZAR, ETH/ZAR, XRP/ZAR) every 5 minutes — it runs whether or not this app is open. It tells you the direction, where to enter, where to set your stop loss, and where to take profit. Accepting opens a real paper position that closes itself against live prices; ZuShé never trades without your approval.'
         )
       ),
+      // Source filter
+      e('div',{style:{padding:'0 12px 8px',display:'flex',gap:6}},
+        [{id:'all',lbl:'All'},{id:'ai_scan',lbl:'AI'},{id:'telegram',lbl:'Telegram'}].map(t=>
+          e('button',{key:t.id,className:'tab '+(srcTab===t.id?'on':''),onClick:()=>setSrcTab(t.id)},t.lbl)
+        )
+      ),
+      srcTab==='telegram'&&e('div',{style:{margin:'0 12px 10px',padding:'12px',background:'var(--glass)',border:'1px dashed var(--border)',borderRadius:12}},
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:1.5,marginBottom:6}},'📨 TELEGRAM SCREENSHOT → SIGNAL'),
+        e('div',{style:{fontSize:11,color:'var(--text3)',lineHeight:1.6,marginBottom:8}},'Upload a screenshot of a trade call. ZuShé reads the pair, direction, entry, stop and take-profit and adds it to Pending. Only BTC/ETH/XRP/LTC vs ZAR can open auto-closing paper trades; anything else is logged for manual tracking.'),
+        e('input',{className:'inp',placeholder:'Channel or trader name (optional)',value:tgLabel,onChange:ev=>setTgLabel(ev.target.value),style:{marginBottom:8}}),
+        e('input',{ref:fileRef,type:'file',accept:'image/*',style:{display:'none'},onChange:onPickTelegram}),
+        e('button',{className:'btn btn-green btn-sm',disabled:tgBusy,onClick:()=>fileRef.current&&fileRef.current.click()},tgBusy?'Reading screenshot…':'📷 Choose screenshot')
+      ),
       // Tab bar with descriptions
       e('div',{style:{padding:'0 12px 8px'}},
         e('div',{style:{display:'flex',gap:4,overflowX:'auto'}},
@@ -1416,6 +1472,8 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   );
 }
 
+// Must match MIN_SAMPLE_FOR_EVOLUTION in the evolution-engine edge function.
+const EVO_MIN_TRADES=5;
 function EvolutionLab({showToast}){
   const[tab,setTab]=useState('strategies');
   const[pool,setPool]=useState([]);
@@ -1514,7 +1572,7 @@ function EvolutionLab({showToast}){
   };
 
   const activeCount=pool.filter(g=>g.status==='active').length;
-  const readyCount=pool.filter(g=>g.status==='active'&&g.trades_closed>=15).length;
+  const readyCount=pool.filter(g=>g.status==='active'&&g.trades_closed>=EVO_MIN_TRADES).length;
 
   return e('div',{className:'screen'},
     e('div',{className:'hdr'},
@@ -1536,7 +1594,7 @@ function EvolutionLab({showToast}){
           e('span',null,'🧬'),
           e('div',null,
             e('div',{style:{fontWeight:700,marginBottom:2}},'What is a Strategy?'),
-            'These are the actual genomes your evolution engine is running server-side, on their own R10,000 sandbox account, against live BTC/ZAR data — separate from your R1,000 demo account. A genome needs 15 closed trades before it can be retired or bred.'
+            'These are the actual genomes your evolution engine is running server-side, on their own R10,000 sandbox account, against live BTC, ETH, XRP and LTC (vs ZAR) 15-minute data — separate from your R1,000 demo account. A genome needs '+EVO_MIN_TRADES+' closed trades before it can be retired or bred.'
           )
         ),
 
@@ -1574,7 +1632,7 @@ function EvolutionLab({showToast}){
                     e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2}},g.family+' · Gen '+g.generation+' · BTC/ZAR · H1')
                   ),
                   e('div',{style:{background:fitColor+'18',color:fitColor,border:'1px solid '+fitColor+'40',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,fontFamily:'var(--mono)',flexShrink:0}},
-                    g.trades_closed>=15?('Fitness '+fit.toFixed(2)):(g.trades_closed+'/15 trades'))
+                    g.trades_closed>=EVO_MIN_TRADES?('Fitness '+fit.toFixed(2)):(g.trades_closed+'/'+EVO_MIN_TRADES+' trades'))
                 ),
                 e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:6,marginBottom:10}},
                   ...[
@@ -1609,7 +1667,7 @@ function EvolutionLab({showToast}){
             }),
 
         activeCount>0&&e('div',{style:{fontSize:10,color:'var(--text3)',textAlign:'center',marginTop:4}},
-          readyCount+' of '+activeCount+' active genomes have reached 15 closed trades — evolution (retire weakest, breed from best) happens automatically once all of them do.')
+          readyCount+' of '+activeCount+' active genomes have reached '+EVO_MIN_TRADES+' closed trades — evolution (retire weakest, breed from best) happens automatically once all of them do.')
       ),
 
       // ── RUN EVOLUTION TAB (triggers the real edge function) ──
@@ -1618,7 +1676,7 @@ function EvolutionLab({showToast}){
           e('span',null,'🧬'),
           e('div',null,
             e('div',{style:{fontWeight:700,marginBottom:2}},'How the real Evolution Engine works'),
-            'Unlike a configurable simulator, this is the actual server-side process: a fixed pool of genomes competes on real BTC/ZAR 1H data on their own R10,000 account. It already runs automatically on a schedule — this button just triggers one cycle immediately so you can see the result right now. Each cycle updates every genome real stats, retires the weakest and breeds a new one from the best once all active genomes have 15+ closed trades, then checks for a fresh entry.'
+            'Unlike a configurable simulator, this is the actual server-side process: a fixed pool of genomes competes on real 15-minute data for BTC, ETH, XRP and LTC (vs ZAR) on their own R10,000 account. It already runs automatically on a schedule — this button just triggers one cycle immediately so you can see the result right now. Each cycle updates every genome real stats, retires the weakest and breeds a new one from the best once all active genomes have '+EVO_MIN_TRADES+'+ closed trades, then checks for a fresh entry.'
           )
         ),
 
@@ -1627,7 +1685,7 @@ function EvolutionLab({showToast}){
           pool.length===0
             ?e('div',{style:{fontSize:12,color:'var(--text3)'}},'Not loaded yet.')
             :e('div',{style:{fontSize:12,color:'var(--text2)',lineHeight:1.8}},
-                activeCount+' active genome'+(activeCount===1?'':'s')+', '+(pool.length-activeCount)+' retired. '+readyCount+' of '+activeCount+' active ones have reached the 15-trade threshold.'
+                activeCount+' active genome'+(activeCount===1?'':'s')+', '+(pool.length-activeCount)+' retired. '+readyCount+' of '+activeCount+' active ones have reached the '+EVO_MIN_TRADES+'-trade threshold.'
               ),
           e('button',{className:'btn btn-primary',style:{marginTop:14,width:'100%'},disabled:running,onClick:runEvolutionNow},
             running?e('span',{style:{display:'flex',alignItems:'center',justifyContent:'center',gap:8}},e('div',{className:'spinner'}),'Running cycle…'):'🧬 Run Evolution Cycle Now'
@@ -3532,6 +3590,20 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     if (error) console.warn('[ZuShé Trader] decideSignal failed:', error.message || error);
   }
 
+  // Telegram screenshot -> signal. The edge function reads the image with
+  // vision, extracts the trade call and inserts it into trader_signals with
+  // source:'telegram'. Needs the ANTHROPIC_API_KEY secret on the project.
+  async function zsSubmitTelegramSignal(imageBase64, mediaType, sourceLabel) {
+    const res = await fetch(`${ZS_SUPABASE_URL}/functions/v1/telegram-signal-parse`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_base64: imageBase64, media_type: mediaType, source_label: sourceLabel })
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok && !j.error) j.error = 'Parser HTTP ' + res.status;
+    return j;
+  }
+
   async function zsPersistAccount(patch) {
     const db = zsInitSupabase();
     if (!db) return;
@@ -3650,6 +3722,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     closeTrade: zsCloseTrade,
     loadSignals: zsLoadSignals,
     decideSignal: zsDecideSignal,
+    submitTelegramSignal: zsSubmitTelegramSignal,
     persistAccount: zsPersistAccount,
     getAccount: () => zsAccount,
     getPushSubscription: zsGetPushSubscription,
