@@ -1815,8 +1815,15 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
     if(pos.paper){
       // Real paper position (opened by the Paper Engine off live Luno data).
       // Manual close uses the last real fetched price, never a random outcome.
-      const mkt=paperLoad(PAPER_LS.market,{lastPrice:0});
-      const last=Number(mkt.lastPrice)||pos.entry;
+      // Use THIS position's own pair price. (It used to read a single shared
+      // "focused pair" price, so closing an LTC/XRP trade could use BTC's price.)
+      const last=Number(livePrices&&livePrices[pos.pair]);
+      if(!Number.isFinite(last)||last<=0){
+        showToast('Waiting for a live '+zsPairAsset(pos.pair)+' price — try again in a few seconds.','warning');return;
+      }
+      if(Math.abs(last/pos.entry-1)>0.5){
+        showToast('Price looks wrong for this trade ('+last+' vs entry '+pos.entry+') — not closing. Try again shortly.','warning');return;
+      }
       exitPrice=last;
       pl=parseFloat(((pos.dir==='BUY'?(last-pos.entry):(pos.entry-last))*(pos.size||0)).toFixed(2));
       status=pl>=0?'Win':'Loss';
@@ -3293,7 +3300,13 @@ function App(){
         if(!remote||cancelled)return;
         const remoteBalance=Number(remote.balance);
         if(Number.isFinite(remoteBalance)&&Math.abs(remoteBalance-account.balance)>0.005){
-          setAccount(a=>({...a,balance:remoteBalance,equity:remoteBalance}));
+          const remoteDaily=Number(remote.daily_pnl);
+          setAccount(a=>({...a,balance:remoteBalance,equity:remoteBalance,dailyPL:Number.isFinite(remoteDaily)?remoteDaily:a.dailyPL}));
+        }
+        // One-time cleanup of local closed-trade records created by the wrong-pair-price close bug.
+        if(LS.get('za_fix_wrongprice_v1',0)!==1){
+          LS.set('za_fix_wrongprice_v1',1);
+          setAccount(a=>({...a,closedTrades:(a.closedTrades||[]).map(t=>(t.paper&&Math.abs(Number(t.pl)||0)>50000)?{...t,pl:0,exit:t.entry,status:'Void'}:t)}));
         }
       }catch(err){ console.warn('[ZuShé Trader] Could not sync Supabase paper account:',err?.message||err); }
     })();
