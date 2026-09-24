@@ -563,7 +563,7 @@ function paperRiskAllowed(stats,account){
   if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
   return {ok:true};
 }
-const ZS_BUILD='2026-09-24.5';
+const ZS_BUILD='2026-09-24.6-test';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,20000):1000;}
 function paperPositionSize(balance,entry,stop){
@@ -860,6 +860,24 @@ function PaperEngineCard({account,setAccount,showToast}){
     });
   },[account,setAccount,showToast]);
 
+  const runAutoCloseTest=()=>{
+    // Controlled, local-only self-test. It uses the same evaluatePaperExit()
+    // function used by the live paper engine, but does not touch Supabase,
+    // localStorage, the user's balance, or any real order.
+    const fakeBuy={id:'TEST-BUY',pair:'LTCZAR',dir:'BUY',entry:100,sl:95,tp:110,size:0,paper:true};
+    const fakeSell={id:'TEST-SELL',pair:'LTCZAR',dir:'SELL',entry:100,sl:105,tp:90,size:0,paper:true};
+    const buyExit=evaluatePaperExit(fakeBuy,120);
+    const sellExit=evaluatePaperExit(fakeSell,80);
+    const buyPass=buyExit?.trigger==='Take-profit'&&buyExit?.status==='Win'&&buyExit?.exitPrice===110;
+    const sellPass=sellExit?.trigger==='Take-profit'&&sellExit?.status==='Win'&&sellExit?.exitPrice===90;
+    if(buyPass&&sellPass){
+      showToast('✅ AUTO-CLOSE TEST PASSED — BUY and SELL TP logic both triggered correctly.','success');
+      return true;
+    }
+    showToast('❌ AUTO-CLOSE TEST FAILED — exit logic needs inspection.','error');
+    return false;
+  };
+
   const run=async(targetPair=pair)=>{
     if(busy)return;
     setBusy(true);
@@ -970,6 +988,7 @@ function PaperEngineCard({account,setAccount,showToast}){
       e('button',{className:'btn',style:{flex:1},onClick:paperTrade,disabled:signal.direction==='NO TRADE'||signal.pair!==pair},'Open Paper Trade')
     ),
     e('button',{className:'btn',style:{width:'100%',marginBottom:9},onClick:runScan,disabled:scanning},scanning?'Scanning watchlist…':'⌕ Scan Watchlist ('+PAPER_CONFIG.watchlist.length+' pairs)'),
+    e('button',{className:'btn btn-ghost',style:{width:'100%',marginBottom:9},onClick:runAutoCloseTest},'🧪 Run Auto-Close Test (Safe)'),
     (scan.results||[]).length>0?e('div',{style:{marginBottom:9}},
       e('div',{style:{fontSize:9,color:'var(--text3)',marginBottom:5,letterSpacing:.5}},'RANKED OPPORTUNITIES'),
       ...scan.results.slice(0,3).map((r,i)=>e('div',{key:i,onClick:()=>r.ok&&focusPair(r.pair),
