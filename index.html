@@ -563,8 +563,11 @@ function paperRiskAllowed(stats,account){
   if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
   return {ok:true};
 }
+const ZS_BUILD='2026-09-24.2';
+// Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
+function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,20000):1000;}
 function paperPositionSize(balance,entry,stop){
-  const risk=balance*PAPER_CONFIG.riskPerTrade;
+  const risk=paperSizingBalance(balance)*PAPER_CONFIG.riskPerTrade;
   const distance=Math.abs(entry-stop);
   return distance>0?risk/distance:0;
 }
@@ -575,7 +578,7 @@ function createPaperPosition(signal,balance){
   const tp=signal.direction==='BUY'?entry+signal.stopDistance*2:entry-signal.stopDistance*2;
   return {
     id:'PT-'+Date.now(),dbId:zsGenId(),pair:signal.pair,dir:signal.direction,entry,sl:stop,tp,
-    size:paperPositionSize(balance,entry,stop),risk:balance*PAPER_CONFIG.riskPerTrade,
+    size:paperPositionSize(balance,entry,stop),risk:paperSizingBalance(balance)*PAPER_CONFIG.riskPerTrade,
     strategy:signal.strategy,confidence:signal.confidence,openedAt:Date.now(),paper:true
   };
 }
@@ -852,10 +855,7 @@ function PaperEngineCard({account,setAccount,showToast}){
         closedTrades:[trade,...(a.closedTrades||[])],
         used:parseFloat(Math.max(0,(a.used||0)-pos.risk).toFixed(2))
       }));
-      window.ZuShePaperDB?.closeTrade?.(trade)?.catch?.(()=>{});
-      const remote=window.ZuShePaperDB?.getAccount?.();
-      const priorRealized=Number(remote?.realized_pnl||0);
-      window.ZuShePaperDB?.persistAccount?.({balance:newBalance,equity:newBalance,realized_pnl:parseFloat((priorRealized+pl).toFixed(2)),daily_pnl:newDailyPL})?.catch?.(()=>{});
+      zsSettleClose(trade,setAccount);
       showToast((exit.status==='Win'?'🟢 Paper '+exit.trigger.toLowerCase()+' hit: +':'🔴 Paper '+exit.trigger.toLowerCase()+' hit: ')+fmtCur(Math.abs(pl)),exit.status==='Win'?'success':'error');
     });
   },[account,setAccount,showToast]);
@@ -916,47 +916,7 @@ function PaperEngineCard({account,setAccount,showToast}){
 
   useEffect(()=>{ loadSentiment(); },[]);
 
-  // A server-side cron job (paper-exit-check Edge Function, every 5 min) now
-  // closes positions against live Luno prices even when this tab is closed.
-  // On load, pull what actually happened in Supabase and fold any closes the
-  // browser missed into local state (openPositions/closedTrades/balance) and
-  // into the local risk stats used by paperRiskAllowed, so both the display
-  // and the circuit breaker reflect reality rather than a stale snapshot.
-  useEffect(()=>{
-    (async()=>{
-      try{
-        const trades=await window.ZuShePaperDB?.loadTrades?.(50);
-        if(!trades||!trades.length)return;
-        const closedMap={};
-        trades.forEach(t=>{ if(t.status==='CLOSED') closedMap[t.id]=t; });
-        const localOpen=account.openPositions||[];
-        const newlyClosed=localOpen.filter(p=>p.dbId&&closedMap[p.dbId]);
-        if(!newlyClosed.length)return;
-        const stillOpen=localOpen.filter(p=>!(p.dbId&&closedMap[p.dbId]));
-        let totalPl=0;
-        const newClosedTrades=newlyClosed.map(p=>{
-          const remote=closedMap[p.dbId];
-          const pl=Number(remote.net_pnl||0);
-          totalPl+=pl;
-          recordPaperTradeResult(pl);
-          return {...p,exit:Number(remote.exit_price||0),pl,
-            closeTime:remote.exit_time||new Date().toISOString(),
-            status:pl>=0?'Win':'Loss',
-            trigger:(remote.exit_reason||'Closed')+' (while app was closed)'};
-        });
-        const newBalance=parseFloat((account.balance+totalPl).toFixed(2));
-        setAccount({...account,
-          openPositions:stillOpen,
-          closedTrades:[...newClosedTrades,...(account.closedTrades||[])],
-          balance:newBalance,
-          equity:newBalance,
-          dailyPL:parseFloat(((account.dailyPL||0)+totalPl).toFixed(2)),
-          used:parseFloat(Math.max(0,(account.used||0)-newlyClosed.reduce((s,p)=>s+(p.risk||0),0)).toFixed(2))
-        });
-        showToast(newlyClosed.length+' paper position(s) auto-closed while the app was closed — synced ('+fmtCur(totalPl)+').',totalPl>=0?'success':'error');
-      }catch(err){ console.warn('[ZuShé Trader] server reconciliation failed:',err); }
-    })();
-  },[]);
+  // (Server reconciliation now lives in App.syncFromServer.)
 
   useEffect(()=>{
     if(!auto)return;
@@ -1039,7 +999,7 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,li
   const activeStrats=strategies.filter(s=>s.status==='Demo Active').length;
   const pendingSigs=signals.filter(s=>s.status==='Pending').length;
   const equity=liveEquity!=null?liveEquity:account.balance;
-  const equityData=[1000,1005,998,1012,1008,1020,1015,1028,1019,1032,1025,equity];
+  const equityData=zsEquityCurve(account,equity);
   const totalReturn=((account.balance-1000)/1000*100);
 
   return e('div',{className:'screen'},
@@ -1186,6 +1146,33 @@ function zsPairAsset(pair){
   if(pair==='LTCZAR')return 'LTC';
   return pair;
 }
+// Saves a close to Supabase, then rebuilds the account balance from the sum of ALL closed trades
+// (never from local arithmetic), so a bad local balance can no longer be written back to the server.
+function zsSettleClose(trade,setAccount){
+  const db=window.ZuShePaperDB; if(!db)return;
+  Promise.resolve(db.closeTrade?.(trade)).then(()=>db.recomputeAccount?.()).then(r=>{
+    if(r&&Number.isFinite(Number(r.balance))){
+      const b=Number(r.balance);
+      setAccount(a=>({...a,balance:b,equity:b,dailyPL:Number(r.daily_pnl)||0}));
+    }
+  }).catch(err=>console.warn('[ZuShé Trader] settle close failed:',err?.message||err));
+}
+function zsRowToPos(t){
+  return {id:'PT-'+String(t.id).slice(0,8),dbId:t.id,pair:t.pair,market:zsPairAsset(t.pair),dir:t.direction,entry:Number(t.entry_price),sl:Number(t.stop_price),tp:Number(t.take_profit),size:Number(t.quantity),risk:Number(t.risk_amount),strategy:t.strategy,strat:t.strategy,confidence:Number(t.metadata&&t.metadata.confidence)||0,openedAt:Date.parse(t.entry_time)||Date.now(),paper:true};
+}
+function zsRowToClosed(t){
+  const pl=Number(t.net_pnl)||0;
+  return {...zsRowToPos(t),exit:Number(t.exit_price)||0,pl,closeTime:t.exit_time,status:pl>=0?'Win':'Loss',trigger:t.exit_reason||'Closed'};
+}
+function zsIsVoided(t){return String(t.exit_reason||'').startsWith('Voided');}
+// Real equity curve from closed trades (oldest first), ending at live equity.
+function zsEquityCurve(account,equity){
+  const closed=(account.closedTrades||[]).filter(t=>t.closeTime&&t.status!=='Void').slice().sort((a,b)=>new Date(a.closeTime)-new Date(b.closeTime));
+  let bal=1000;const pts=[1000];
+  closed.forEach(t=>{bal+=Number(t.pl)||0;pts.push(parseFloat(bal.toFixed(2)));});
+  pts.push(equity);
+  return pts.slice(-60);
+}
 function mapDbSignalToUi(row,account){
   const wl=PAPER_CONFIG.watchlist.find(w=>w.id===row.pair);
   const entry=Number(row.entry_price)||0,sl=Number(row.stop_price)||0,tp=Number(row.take_profit)||0;
@@ -1276,7 +1263,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     if(account.openPositions.length>=riskSettings.maxOpenTrades){
       showToast('Max open trades ('+riskSettings.maxOpenTrades+') already reached. Close a position first.','warning');return;
     }
-    const risk=parseFloat((account.balance*PAPER_CONFIG.riskPerTrade).toFixed(2));
+    const risk=parseFloat((paperSizingBalance(account.balance)*PAPER_CONFIG.riskPerTrade).toFixed(2));
     const size=paperPositionSize(account.balance,sig.entry,sig.sl);
     const pos={id:'PT-'+Date.now(),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size,risk,strategy:sig.strat,confidence:sig.conf,openedAt:Date.now(),paper:true,sigId:sig.id};
     setSignals(ss=>ss.map(s=>s.id===sig.id?{...s,status:'Accepted'}:s));
@@ -1298,7 +1285,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     const skippedN=cand.length-chosen.length;
     if(!window.confirm('Open '+chosen.length+' paper trade'+(chosen.length>1?'s':'')+' now?'+(skippedN?'\n('+skippedN+' more will stay pending — open-trade limit reached.)':'')+'\n\nEach risks '+(PAPER_CONFIG.riskPerTrade*100)+'% of your paper balance.'))return;
     const now=Date.now();
-    const perRisk=parseFloat((account.balance*PAPER_CONFIG.riskPerTrade).toFixed(2));
+    const perRisk=parseFloat((paperSizingBalance(account.balance)*PAPER_CONFIG.riskPerTrade).toFixed(2));
     const newPos=chosen.map((sig,i)=>({id:'PT-'+(now+i),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size:paperPositionSize(account.balance,sig.entry,sig.sl),risk:perRisk,strategy:sig.strat,confidence:sig.conf,openedAt:now+i,paper:true,sigId:sig.id}));
     const ids=new Set(chosen.map(s=>s.id));
     setSignals(ss=>ss.map(s=>ids.has(s.id)?{...s,status:'Accepted'}:s));
@@ -1806,7 +1793,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
   const[tab,setTab]=useState('open');
   const equity=liveEquity!=null?liveEquity:account.balance;
   const totalReturn=((account.balance-1000)/1000*100);
-  const equityData=[1000,1005,998,1012,1008,1020,1015,1028,1019,1032,1025,equity];
+  const equityData=zsEquityCurve(account,equity);
 
   const closePosition=(posId)=>{
     const pos=account.openPositions.find(p=>p.id===posId);
@@ -1846,10 +1833,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
       used:parseFloat(Math.max(0,a.used-pos.risk).toFixed(2))
     }));
     if(pos.paper){
-      window.ZuShePaperDB?.closeTrade?.(trade)?.catch?.(()=>{});
-      const remote=window.ZuShePaperDB?.getAccount?.();
-      const priorRealized=Number(remote?.realized_pnl||0);
-      window.ZuShePaperDB?.persistAccount?.({balance:newBalance,equity:newBalance,realized_pnl:parseFloat((priorRealized+pl).toFixed(2)),daily_pnl:newDailyPL})?.catch?.(()=>{});
+      zsSettleClose(trade,setAccount);
     }
     showToast((pl>=0?'🟢 Trade closed profit: +':'🔴 Trade closed loss: ')+fmtCur(Math.abs(pl)),pl>=0?'success':'error');
   };
@@ -1942,9 +1926,9 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
                 e('div',null,
                   e('div',{style:{display:'flex',alignItems:'center',gap:8,marginBottom:2}},
                     e('span',{className:'pill '+(pos.dir==='BUY'?'pill-buy':'pill-sell')},pos.dir==='BUY'?'▲ BUY':'▼ SELL'),
-                    e('span',{style:{fontWeight:800,fontSize:15}},pos.market)
+                    e('span',{style:{fontWeight:800,fontSize:15}},pos.market||zsPairAsset(pos.pair))
                   ),
-                  e('div',{style:{fontSize:11,color:'var(--text3)'}},pos.strat)
+                  e('div',{style:{fontSize:11,color:'var(--text3)'}},pos.strat||pos.strategy)
                 ),
                 e('div',{style:{textAlign:'right'}},
                   e('div',{style:{fontSize:10,color:'var(--text3)'}},'At risk'),
@@ -1980,7 +1964,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
                 e('div',{style:{fontSize:11,color:'var(--text3)'}},
                   e('span',{className:'live-dot amber'}),
                   pos.size,' · ',
-                  e('span',{style:{fontSize:11,color:'var(--text3)'}},'Opened ',new Date(pos.openTime||Date.now()).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}))
+                  e('span',{style:{fontSize:11,color:'var(--text3)'}},'Opened ',new Date(pos.openTime||pos.openedAt||Date.now()).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}))
                 ),
                 e('button',{className:'btn btn-red btn-xs',onClick:()=>closePosition(pos.id)},'Close Now')
               )
@@ -3205,6 +3189,7 @@ function AppSettings({showToast,onLogout,account,setAccount}){
           '🔒 Lock App — Return to Passcode Screen'
         )
       ),
+      e('div',{style:{textAlign:'center',fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',padding:'0 0 8px'}},'Build '+ZS_BUILD),
 
       e('div',{className:'disc',style:{padding:'12px 16px 16px'}},
         'ZuShé Trader is a private personal research and trading-assistance tool. It does not provide financial advice, does not guarantee profits or specific results, and all trading involves the risk of loss. This system is not a licensed financial service and does not hold or manage client funds.'
@@ -3286,31 +3271,71 @@ function App(){
   useEffect(()=>{LS.set('za_account',account);},[account]);
   useEffect(()=>{LS.set('za_risk',riskSettings);},[riskSettings]);
 
-  // One-time bootstrap: adopt the Supabase paper account balance if one
-  // already exists there and differs from a fresh R1,000 start — otherwise
-  // the Paper Engine's real trade history silently diverges from what this
-  // screen shows after a reload on a different device/session.
+  // Server is the source of truth. On load, every 60s and whenever the tab becomes visible:
+  // rebuild balance, open positions and closed trades from Supabase, and self-heal the server
+  // balance if it ever disagrees with the sum of closed trades.
+  const accountRef=useRef(account);accountRef.current=account;
+  const syncFromServer=useCallback(async()=>{
+    const db=window.ZuShePaperDB; if(!db?.ensureAccount)return;
+    try{
+      let remote=await db.ensureAccount(); if(!remote)return;
+      const LIMIT=500;
+      const rows=await db.loadTrades(LIMIT);
+      const complete=rows.length<LIMIT;
+      const tz=d=>new Date(d).toLocaleDateString('en-CA',{timeZone:'Africa/Johannesburg'});
+      const today=tz(Date.now());
+      const openRows=rows.filter(t=>t.status==='OPEN');
+      const closedAll=rows.filter(t=>t.status==='CLOSED');
+      const closedRows=closedAll.filter(t=>!zsIsVoided(t));
+      const voidedIds=new Set(closedAll.filter(zsIsVoided).map(t=>t.id));
+      if(complete){
+        const start=Number(remote.starting_balance)||1000;
+        const expected=parseFloat((start+closedAll.reduce((s,t)=>s+(Number(t.net_pnl)||0),0)).toFixed(2));
+        if(Math.abs(expected-Number(remote.balance))>0.05){
+          try{const fixed=await db.recomputeAccount(); if(fixed)remote=fixed;}catch(_e){}
+        }
+      }
+      const balance=Number(remote.balance);
+      if(!Number.isFinite(balance))return;
+      const daily=parseFloat(closedAll.filter(t=>t.exit_time&&tz(t.exit_time)===today).reduce((s,t)=>s+(Number(t.net_pnl)||0),0).toFixed(2));
+      // local positions that closed on the server since we last looked -> feed the local risk stats
+      const openIds=new Set(openRows.map(t=>t.id));
+      const closedById={};closedRows.forEach(t=>{closedById[t.id]=t;});
+      (accountRef.current.openPositions||[]).forEach(p=>{
+        if(p.paper&&p.dbId&&!openIds.has(p.dbId)&&closedById[p.dbId])recordPaperTradeResult(Number(closedById[p.dbId].net_pnl)||0);
+      });
+      setAccount(a=>{
+        const localOpen=a.openPositions||[];
+        const byDb={};localOpen.forEach(p=>{if(p.dbId)byDb[p.dbId]=p;});
+        const serverOpen=openRows.map(t=>{const p=byDb[t.id];return p?{...p,market:p.market||zsPairAsset(p.pair),strat:p.strat||p.strategy}:zsRowToPos(t);});
+        const recent=Date.now()-2*60*1000;
+        const keepLocal=localOpen.filter(p=>{
+          if(!p.paper||!p.dbId)return true; // demo / legacy positions are left alone
+          if(openIds.has(p.dbId))return false;          // already taken from the server list
+          if(closedAll.some(t=>t.id===p.dbId))return false; // closed or voided on the server
+          return !complete||(p.openedAt||0)>recent;     // unknown to server: keep only if too new / list incomplete
+        });
+        const openPositions=[...serverOpen,...keepLocal];
+        const serverClosedIds=new Set(closedAll.map(t=>t.id));
+        const localClosedKept=(a.closedTrades||[]).filter(t=>t.status!=='Void'&&!(t.dbId&&(serverClosedIds.has(t.dbId)||voidedIds.has(t.dbId)))&&!(t.paper&&Math.abs(Number(t.pl)||0)>50000));
+        const closedTrades=[...closedRows.map(zsRowToClosed),...localClosedKept].sort((x,y)=>new Date(y.closeTime||0)-new Date(x.closeTime||0));
+        return {...a,balance,equity:balance,dailyPL:daily,openPositions,closedTrades,
+          used:parseFloat(openPositions.reduce((s,p)=>s+(Number(p.risk)||0),0).toFixed(2))};
+      });
+    }catch(err){ console.warn('[ZuShé Trader] Could not sync Supabase paper account:',err?.message||err); }
+  },[]);
   useEffect(()=>{
-    let cancelled=false;
+    let cancelled=false,iv=null;
     (async()=>{
       for(let i=0;i<20&&!window.ZuShePaperDB;i++){ await new Promise(r=>setTimeout(r,150)); }
       if(cancelled||!window.ZuShePaperDB)return;
-      try{
-        const remote=await window.ZuShePaperDB.ensureAccount();
-        if(!remote||cancelled)return;
-        const remoteBalance=Number(remote.balance);
-        if(Number.isFinite(remoteBalance)&&Math.abs(remoteBalance-account.balance)>0.005){
-          const remoteDaily=Number(remote.daily_pnl);
-          setAccount(a=>({...a,balance:remoteBalance,equity:remoteBalance,dailyPL:Number.isFinite(remoteDaily)?remoteDaily:a.dailyPL}));
-        }
-        // One-time cleanup of local closed-trade records created by the wrong-pair-price close bug.
-        if(LS.get('za_fix_wrongprice_v1',0)!==1){
-          LS.set('za_fix_wrongprice_v1',1);
-          setAccount(a=>({...a,closedTrades:(a.closedTrades||[]).map(t=>(t.paper&&Math.abs(Number(t.pl)||0)>50000)?{...t,pl:0,exit:t.entry,status:'Void'}:t)}));
-        }
-      }catch(err){ console.warn('[ZuShé Trader] Could not sync Supabase paper account:',err?.message||err); }
+      syncFromServer();
+      iv=setInterval(syncFromServer,60000);
     })();
-    return()=>{cancelled=true;};
+    const onVis=()=>{ if(document.visibilityState==='visible')syncFromServer(); };
+    document.addEventListener('visibilitychange',onVis);
+    console.info('[ZuShé Trader] build',ZS_BUILD);
+    return()=>{cancelled=true;if(iv)clearInterval(iv);document.removeEventListener('visibilitychange',onVis);};
   },[]);
 
   // Pulls the latest signals from trader_signals (written by the signal-scan
@@ -3690,8 +3715,31 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       gross_pnl: pl,
       net_pnl: pl
     };
+    const ent = Number(trade.entry), ex = Number(trade.exit);
+    if (ent > 0 && ex > 0 && Math.abs(ex / ent - 1) > 0.5) {
+      throw new Error('Refusing to save a close price more than 50% away from entry (' + ex + ' vs ' + ent + ')');
+    }
     const { error } = await db.from('trader_paper_trades').update(payload).eq('id', trade.dbId);
-    if (error) console.warn('[ZuShé Trader] closeTrade failed:', error.message || error);
+    if (error) { console.warn('[ZuShé Trader] closeTrade failed:', error.message || error); throw error; }
+  }
+
+  // Rebuilds balance/equity/realized/daily P&L from the sum of every closed trade. Idempotent.
+  async function zsRecomputeAccount() {
+    const db = zsInitSupabase();
+    if (!db) return null;
+    const account = zsAccount || await zsEnsureAccount();
+    const { data, error } = await db.from('trader_paper_trades').select('net_pnl,exit_time')
+      .eq('account_id', account.id).eq('status', 'CLOSED').limit(5000);
+    if (error) throw error;
+    const tz = d => new Date(d).toLocaleDateString('en-CA', { timeZone: 'Africa/Johannesburg' });
+    const today = tz(Date.now());
+    let sum = 0, daily = 0;
+    (data || []).forEach(t => {
+      const p = Number(t.net_pnl) || 0; sum += p;
+      if (t.exit_time && tz(t.exit_time) === today) daily += p;
+    });
+    const balance = parseFloat(((Number(account.starting_balance) || 1000) + sum).toFixed(2));
+    return zsPersistAccount({ balance, equity: balance, realized_pnl: parseFloat(sum.toFixed(2)), daily_pnl: parseFloat(daily.toFixed(2)) });
   }
 
   // ---- Signal Desk (server-generated signals) ----------------------
@@ -3875,6 +3923,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     saveSecret: zsSaveSecret,
     clearSecret: zsClearSecret,
     persistAccount: zsPersistAccount,
+    recomputeAccount: zsRecomputeAccount,
     getAccount: () => zsAccount,
     getPushSubscription: zsGetPushSubscription,
     subscribePush: zsSubscribePush,
