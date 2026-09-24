@@ -563,7 +563,7 @@ function paperRiskAllowed(stats,account){
   if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
   return {ok:true};
 }
-const ZS_BUILD='2026-09-24.3';
+const ZS_BUILD='2026-09-24.4';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,20000):1000;}
 function paperPositionSize(balance,entry,stop){
@@ -1145,6 +1145,24 @@ function zsPairAsset(pair){
   if(pair==='XRPZAR')return 'XRP';
   if(pair==='LTCZAR')return 'LTC';
   return pair;
+}
+// Human-readable "how long was this trade open" — used on Closed Trade cards.
+function zsFmtDuration(ms){
+  if(!Number.isFinite(ms)||ms<0)return '—';
+  const m=Math.round(ms/60000);
+  if(m<1)return '<1m';
+  if(m<60)return m+'m';
+  const h=Math.floor(m/60),rm=m%60;
+  if(h<24)return h+'h'+(rm?' '+rm+'m':'');
+  const d=Math.floor(h/24),rh=h%24;
+  return d+'d'+(rh?' '+rh+'h':'');
+}
+// A closed trade's exit trigger, normalised into 3 buckets for grouping/pills.
+function zsExitBucket(t){
+  const trig=String(t.trigger||'').toLowerCase();
+  if(trig==='take-profit'||trig.includes('take-profit'))return 'tp';
+  if(trig==='stop-loss'||trig.includes('stop-loss'))return 'sl';
+  return 'manual';
 }
 // Saves a close to Supabase, then rebuilds the account balance from the sum of ALL closed trades
 // (never from local arithmetic), so a bad local balance can no longer be written back to the server.
@@ -1888,6 +1906,74 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
   const losses=account.closedTrades.filter(t=>t.pl<=0);
   const winRate=account.closedTrades.length>0?Math.round(wins.length/account.closedTrades.length*100):0;
 
+  // Split closed trades into the groups the Closed Trades tab shows separately:
+  // hit Take-Profit, hit Stop-Loss, or closed by hand (manual / anything else).
+  const tpTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='tp'),[account.closedTrades]);
+  const slTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='sl'),[account.closedTrades]);
+  const manualTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='manual'),[account.closedTrades]);
+  const groupStats=(list)=>{
+    const gw=list.filter(t=>t.pl>0),gl=list.filter(t=>t.pl<=0);
+    const net=list.reduce((s,t)=>s+(Number(t.pl)||0),0);
+    return {count:list.length,wins:gw.length,losses:gl.length,net,winRate:list.length?Math.round(gw.length/list.length*100):0};
+  };
+
+  // One closed-trade card with everything needed to understand the trade at a
+  // glance: direction/pair, P/L + R-multiple, entry->exit, SL/TP, strategy,
+  // size, and how long it was open. bucket controls the trigger pill's colour.
+  const renderTradeCard=(t,i,bucket)=>{
+    const risk=Number(t.risk)||0;
+    const rMult=risk>0?(t.pl/risk):null;
+    const dur=zsFmtDuration((t.closeTime?new Date(t.closeTime).getTime():Date.now())-(t.openedAt||0));
+    const trigLbl=bucket==='tp'?'Take-Profit':bucket==='sl'?'Stop-Loss':(t.trigger||'Manual close');
+    const trigCls=bucket==='tp'?'pill-cyan':bucket==='sl'?'pill-watch':'pill-purple';
+    return e('div',{key:t.id||'ct_'+i,className:'card card-sm'},
+      e('div',{className:'row',style:{marginBottom:6}},
+        e('div',{style:{display:'flex',gap:8,alignItems:'center'}},
+          e('span',{className:'pill '+(t.dir==='BUY'?'pill-buy':'pill-sell')},t.dir),
+          e('span',{style:{fontWeight:700,fontSize:13}},t.market),
+          e('span',{className:'pill '+trigCls},trigLbl)
+        ),
+        e('div',{style:{textAlign:'right'}},
+          e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:15,color:t.pl>=0?'var(--green)':'var(--red)'}},(t.pl>=0?'+':'')+fmtCur(t.pl)),
+          e('div',{style:{fontSize:10,color:'var(--text3)'}},rMult!=null?rMult.toFixed(2)+'R':(t.pl>=0?'Profit':'Loss'))
+        )
+      ),
+      e('div',{style:{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--text3)',marginBottom:3}},
+        e('span',null,'Entry ',e('span',{style:{fontFamily:'var(--mono)',color:'var(--text2)'}},t.entry)),
+        e('span',null,'Exit ',e('span',{style:{fontFamily:'var(--mono)',color:'var(--text2)'}},t.exit))
+      ),
+      e('div',{style:{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--text3)'}},
+        e('span',null,t.strat||t.strategy||'Manual'),
+        e('span',null,dur+' · '+(t.closeTime?new Date(t.closeTime).toLocaleDateString([],{day:'2-digit',month:'short'})+' '+new Date(t.closeTime).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'Today'))
+      )
+    );
+  };
+
+  // A titled section for one closed-trade bucket: subtotal header (count,
+  // win rate, net P/L) followed by that bucket's cards, oldest-excluded —
+  // account.closedTrades already comes sorted newest-first.
+  const renderClosedGroup=(key,icon,title,sub,list,bucket,emptyMsg)=>{
+    const s=groupStats(list);
+    return e('div',{key},
+      e('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'10px 12px 6px'}},
+        e('div',{style:{display:'flex',alignItems:'center',gap:8}},
+          e('span',{style:{fontSize:15}},icon),
+          e('div',null,
+            e('div',{style:{fontWeight:700,fontSize:13}},title+' ('+s.count+')'),
+            e('div',{style:{fontSize:10,color:'var(--text3)'}},sub)
+          )
+        ),
+        s.count>0&&e('div',{style:{textAlign:'right'}},
+          e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:13,color:s.net>=0?'var(--green)':'var(--red)'}},(s.net>=0?'+':'')+fmtCur(s.net)),
+          e('div',{style:{fontSize:9,color:'var(--text3)'}},s.winRate+'% win rate')
+        )
+      ),
+      s.count===0
+        ?e('div',{style:{padding:'0 12px 14px',fontSize:11,color:'var(--text3)'}},emptyMsg)
+        :e('div',{style:{paddingBottom:6}},list.map((t,i)=>renderTradeCard(t,i,bucket)))
+    );
+  };
+
   return e('div',{className:'screen'},
     e('div',{className:'hdr'},
       e('div',null,
@@ -2017,31 +2103,21 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
             );})
       ),
 
-      // Closed trades
+      // Closed trades — split into Take-Profit / Stop-Loss / Manual so it's
+      // obvious at a glance which trades ran their course vs. were hand-closed.
       tab==='closed'&&e('div',null,
-        e('div',{style:{padding:'0 12px 8px',fontSize:11,color:'var(--text3)',lineHeight:1.5}},'Every completed trade — whether it hit Take Profit, Stop Loss, or was manually closed. Use this history to evaluate strategy performance and your own decision-making. All trades are also saved to your Trade Journal.'),
+        e('div',{style:{padding:'0 12px 8px',fontSize:11,color:'var(--text3)',lineHeight:1.5}},'Grouped by how each trade actually ended. Take-Profit and Stop-Loss are the strategy running to plan; Manual is you stepping in early — useful to compare against each other.'),
         account.closedTrades.length===0
           ?e('div',{className:'empty'},
               e('div',{className:'empty-icon'},'📋'),
               e('div',{className:'empty-title'},'No completed trades yet'),
               e('div',{className:'empty-sub'},'Closed trades appear here. Accept a signal from the Signal Desk, then close the position to see your first result.')
             )
-          :account.closedTrades.map((t,i)=>e('div',{key:t.id||'ct_'+i,className:'card card-sm'},
-              e('div',{className:'row',style:{marginBottom:4}},
-                e('div',{style:{display:'flex',gap:8,alignItems:'center'}},
-                  e('span',{className:'pill '+(t.dir==='BUY'?'pill-buy':'pill-sell')},t.dir),
-                  e('span',{style:{fontWeight:700,fontSize:13}},t.market)
-                ),
-                e('div',{style:{textAlign:'right'}},
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:15,color:t.pl>=0?'var(--green)':'var(--red)'}},(t.pl>=0?'+':'')+fmtCur(t.pl)),
-                  e('div',{style:{fontSize:10,color:'var(--text3)'}},t.pl>=0?'Profit':'Loss')
-                )
-              ),
-              e('div',{style:{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--text3)'}},
-                e('span',null,t.strat||'Manual'),
-                e('span',null,t.closeTime?new Date(t.closeTime).toLocaleDateString():'Today')
-              )
-            ))
+          :e('div',null,
+              renderClosedGroup('tp','🎯','Take-Profit Hits','Auto-closed at your target price',tpTrades,'tp','No trades have hit Take-Profit yet.'),
+              renderClosedGroup('sl','🛑','Stop-Loss Hits','Auto-closed to limit the loss',slTrades,'sl','No trades have hit Stop-Loss yet.'),
+              renderClosedGroup('manual','✋','Manually Closed','You closed these by hand before TP/SL',manualTrades,'manual','No manual closes yet.')
+            )
       ),
 
       // Stats
