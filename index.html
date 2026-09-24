@@ -563,7 +563,7 @@ function paperRiskAllowed(stats,account){
   if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
   return {ok:true};
 }
-const ZS_BUILD='2026-09-24.4';
+const ZS_BUILD='2026-09-24.5';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,20000):1000;}
 function paperPositionSize(balance,entry,stop){
@@ -3374,15 +3374,16 @@ function App(){
   });
   const[showToast,ToastContainer]=useToast();
   const[livePrices,setLivePrices]=useState({});
+  // Keep a live reference so background price polling never closes trades
+  // against a stale React render of the account.
+  const accountRef=useRef(account);
+  accountRef.current=account;
+  const closingPaperIds=useRef(new Set());
 
-  // Live mark-to-market: poll the last-traded price for every pair with an
-  // open position, plus every pair with a live (non-rejected) signal on
-  // the Signal Desk (every 60s, plus immediately whenever that pair set
-  // changes) so both Equity and the Signal Desk's Current Price field
-  // reflect the real market instead of a stale/absent value. This never
-  // touches account.balance/equity in state — those stay server-
-  // authoritative, updated only when a position actually closes
-  // (checkExits / paper-exit-check).
+  // Live mark-to-market + automatic paper exits. Every open paper position is
+  // checked against a fresh Luno ticker on the pair's polling cycle. This is
+  // independent of the Paper Engine's optional Auto switch, so TP/SL protection
+  // continues working even when the user is on another screen.
   const livePairSet=[...new Set([
     ...(account.openPositions||[]).map(p=>p.pair),
     ...signals.filter(s=>s.status!=='Rejected').map(s=>s.pair)
@@ -3401,14 +3402,65 @@ function App(){
         }catch(_e){ return [pair,null]; }
       }));
       if(cancelled)return;
-      setLivePrices(prev=>{
-        const next={...prev};
-        entries.forEach(([pair,last])=>{ if(last)next[pair]=last; });
-        return next;
-      });
+
+      const prices={};
+      entries.forEach(([pair,last])=>{ if(last)prices[pair]=last; });
+      setLivePrices(prev=>({...prev,...prices}));
+
+      // Hard exit check: do this from the same fresh ticker data used for
+      // mark-to-market. A trade whose TP/SL has already been crossed must not
+      // remain displayed as OPEN simply because the user has not pressed
+      // Evaluate or enabled the optional Paper Engine Auto switch.
+      const db=window.ZuShePaperDB;
+      const openNow=(accountRef.current.openPositions||[]).filter(p=>p.paper&&p.dbId);
+      for(const pos of openNow){
+        const last=prices[pos.pair];
+        if(!last)continue;
+        const exit=evaluatePaperExit(pos,last);
+        if(!exit||closingPaperIds.current.has(pos.dbId))continue;
+        closingPaperIds.current.add(pos.dbId);
+        try{
+          const pl=parseFloat(((pos.dir==='BUY'
+            ?(exit.exitPrice-pos.entry)
+            :(pos.entry-exit.exitPrice))*(pos.size||0)).toFixed(2));
+          const trade={...pos,exit:exit.exitPrice,pl,
+            closeTime:new Date().toISOString(),
+            status:exit.status,trigger:exit.trigger};
+
+          if(db?.closeTrade) await db.closeTrade(trade);
+          recordPaperTradeResult(pl);
+          setAccount(a=>{
+            const stillOpen=(a.openPositions||[]).some(p=>p.dbId===pos.dbId);
+            if(!stillOpen)return a;
+            const newBalance=parseFloat((Number(a.balance||0)+pl).toFixed(2));
+            return {...a,
+              balance:newBalance,
+              equity:newBalance,
+              dailyPL:parseFloat((Number(a.dailyPL||0)+pl).toFixed(2)),
+              openPositions:(a.openPositions||[]).filter(p=>p.dbId!==pos.dbId),
+              closedTrades:[trade,...(a.closedTrades||[])],
+              used:parseFloat(Math.max(0,(a.used||0)-Number(pos.risk||0)).toFixed(2))
+            };
+          });
+          if(db?.recomputeAccount){
+            const remote=await db.recomputeAccount();
+            if(remote&&Number.isFinite(Number(remote.balance))){
+              setAccount(a=>({...a,
+                balance:Number(remote.balance),
+                equity:Number(remote.balance),
+                dailyPL:Number(remote.daily_pnl)||0
+              }));
+            }
+          }
+        }catch(err){
+          console.warn('[ZuShé Trader] automatic paper exit failed:',err?.message||err);
+        }finally{
+          closingPaperIds.current.delete(pos.dbId);
+        }
+      }
     };
     fetchAll();
-    const iv=setInterval(fetchAll,60000);
+    const iv=setInterval(fetchAll,30000);
     return()=>{cancelled=true;clearInterval(iv);};
   },[openPairsKey]);
 
@@ -3431,7 +3483,6 @@ function App(){
   // Server is the source of truth. On load, every 60s and whenever the tab becomes visible:
   // rebuild balance, open positions and closed trades from Supabase, and self-heal the server
   // balance if it ever disagrees with the sum of closed trades.
-  const accountRef=useRef(account);accountRef.current=account;
   const syncFromServer=useCallback(async()=>{
     const db=window.ZuShePaperDB; if(!db?.ensureAccount)return;
     try{
