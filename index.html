@@ -563,7 +563,7 @@ function paperRiskAllowed(stats,account){
   if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
   return {ok:true};
 }
-const ZS_BUILD='2026-09-24.2';
+const ZS_BUILD='2026-09-24.3';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,20000):1000;}
 function paperPositionSize(balance,entry,stop){
@@ -1791,9 +1791,55 @@ function EvolutionLab({showToast}){
 
 function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,livePrices}){
   const[tab,setTab]=useState('open');
+  const[strategyReview,setStrategyReview]=useState([]);
+  const[srLoading,setSrLoading]=useState(false);
+  const[srBusy,setSrBusy]=useState(null);
   const equity=liveEquity!=null?liveEquity:account.balance;
   const totalReturn=((account.balance-1000)/1000*100);
   const equityData=zsEquityCurve(account,equity);
+
+  const loadStrategyReview=useCallback(async()=>{
+    if(!window.ZuShePaperDB)return;
+    setSrLoading(true);
+    try{
+      const rows=await window.ZuShePaperDB.loadStrategyReview();
+      setStrategyReview(rows||[]);
+    }catch(err){
+      console.warn('[ZuShé Trader] could not load strategy review:',err);
+    }finally{
+      setSrLoading(false);
+    }
+  },[]);
+
+  useEffect(()=>{
+    let cancelled=false,tries=0;
+    const iv=setInterval(()=>{
+      tries++;
+      if(cancelled)return;
+      if(window.ZuShePaperDB||tries>20){
+        clearInterval(iv);
+        loadStrategyReview();
+      }
+    },150);
+    const refresh=setInterval(loadStrategyReview,60000);
+    const onVis=()=>{if(document.visibilityState==='visible')loadStrategyReview();};
+    document.addEventListener('visibilitychange',onVis);
+    return()=>{cancelled=true;clearInterval(iv);clearInterval(refresh);document.removeEventListener('visibilitychange',onVis);};
+  },[loadStrategyReview]);
+
+  const decideStrategy=async(strategy,decision)=>{
+    if(!window.ZuShePaperDB)return;
+    setSrBusy(strategy+':'+decision);
+    try{
+      await window.ZuShePaperDB.decideStrategyReview(strategy,decision);
+      showToast(decision==='approve'?('🚫 '+strategy+' paused — signal-scan will stop generating it.'):('✅ Kept '+strategy+' active.'),decision==='approve'?'warning':'success');
+      await loadStrategyReview();
+    }catch(err){
+      showToast('Could not update '+strategy+': '+(err?.message||err),'error');
+    }finally{
+      setSrBusy(null);
+    }
+  };
 
   const closePosition=(posId)=>{
     const pos=account.openPositions.find(p=>p.id===posId);
@@ -2000,6 +2046,41 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
 
       // Stats
       tab==='stats'&&e('div',null,
+        e('div',{className:'card'},
+          e('div',{className:'row',style:{marginBottom:4}},
+            e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2}},'STRATEGY SCOREKEEPER'),
+            srLoading&&e('span',{style:{fontSize:10,color:'var(--text3)'}},'Refreshing…')
+          ),
+          e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:12,lineHeight:1.5}},'Every strategy is graded from its own closed trades — manual exits count for less than TP/SL hits. A strategy needs 50 closed trades before it can be judged; under that it stays in Learning. Losers are flagged here for you to approve — nothing is ever paused automatically.'),
+          strategyReview.length===0
+            ?e('div',{style:{fontSize:12,color:'var(--text3)'}},'No strategy data yet — close some trades to build a track record.')
+            :strategyReview.map(sr=>{
+              const stateCls=sr.state==='flagged'?'pill-watch':sr.state==='paused'?'pill-sell':'pill-cyan';
+              const stateLbl=sr.state==='flagged'?'FLAGGED':sr.state==='paused'?'PAUSED':'ACTIVE';
+              const verdictLbl={learning:'Learning',needs_auto:'Needs more auto closes',underperforming:'Underperforming',manual_only:'Profitable only via manual exits',proven:'Proven',neutral:'Neutral'}[sr.verdict]||sr.verdict;
+              const wNet=Number(sr.weighted_net)||0;
+              return e('div',{key:sr.strategy,style:{borderBottom:'1px solid var(--border)',paddingBottom:10,marginBottom:10}},
+                e('div',{className:'row',style:{marginBottom:4}},
+                  e('div',{style:{display:'flex',alignItems:'center',gap:8}},
+                    e('span',{style:{fontWeight:700,fontSize:13}},sr.strategy),
+                    e('span',{className:'pill '+stateCls},stateLbl)
+                  ),
+                  e('span',{style:{fontFamily:'var(--mono)',fontSize:12,fontWeight:700,color:wNet>=0?'var(--green)':'var(--red)'}},(wNet>=0?'+':'')+fmtCur(wNet))
+                ),
+                e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:sr.flag_reason?6:0}},
+                  verdictLbl+' · '+sr.closed_trades+' closed ('+sr.auto_trades+' auto / '+sr.manual_trades+' manual)'+
+                  (sr.win_rate!=null?' · '+Math.round(sr.win_rate)+'% win rate':'')+
+                  (sr.open_trades?' · '+sr.open_trades+' open':'')
+                ),
+                sr.flag_reason&&e('div',{style:{fontSize:11,color:'var(--amber)',background:'var(--amber-dim)',border:'1px solid rgba(255,176,32,.25)',borderRadius:8,padding:'8px 10px',marginBottom:8,lineHeight:1.5}},sr.flag_reason),
+                sr.state==='flagged'&&e('div',{className:'btn-row',style:{marginTop:0}},
+                  e('button',{className:'btn btn-red btn-xs',disabled:srBusy===sr.strategy+':approve',onClick:()=>decideStrategy(sr.strategy,'approve')},srBusy===sr.strategy+':approve'?'Pausing…':'Approve removal'),
+                  e('button',{className:'btn btn-ghost btn-xs',disabled:srBusy===sr.strategy+':keep',onClick:()=>decideStrategy(sr.strategy,'keep')},srBusy===sr.strategy+':keep'?'…':'Keep active')
+                ),
+                sr.state==='paused'&&e('div',{style:{fontSize:10,color:'var(--text3)'}},'Paused — signal-scan will not generate new '+sr.strategy+' signals.')
+              );
+            })
+        ),
         e('div',{className:'card'},
           e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:14}},'PERFORMANCE ANALYSIS'),
           ...[
@@ -3672,6 +3753,49 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     return j;
   }
 
+  // ── Strategy Scorekeeper ───────────────────────────────────────────
+  // Reads/writes trader_strategy_review for the PRIMARY paper account
+  // (not the evolution sandbox). The strategy-review cron edge function
+  // grades every strategy from its closed trades and flags losers; this
+  // app never pauses anything on its own — only these two actions do:
+  //   approve -> state='paused' (signal-scan stops generating that strategy)
+  //   keep    -> state='active', dismissed until RE_REVIEW_AFTER more
+  //              closed trades so the same flag doesn't reappear every cycle
+  async function zsLoadStrategyReview() {
+    const db = zsInitSupabase();
+    if (!db) return [];
+    const account = zsAccount || await zsEnsureAccount();
+    if (!account) return [];
+    const { data, error } = await db.from('trader_strategy_review').select('*').eq('account_id', account.id)
+      .order('state', { ascending: true }).order('strategy', { ascending: true });
+    if (error) { console.warn('[ZuShé Trader] loadStrategyReview failed:', error.message || error); return []; }
+    return data || [];
+  }
+
+  async function zsDecideStrategyReview(strategy, decision) {
+    const db = zsInitSupabase();
+    if (!db) return null;
+    const account = zsAccount || await zsEnsureAccount();
+    if (!account) return null;
+    const patch = { decided_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    if (decision === 'approve') {
+      patch.state = 'paused';
+    } else if (decision === 'keep') {
+      const { data: row } = await db.from('trader_strategy_review').select('closed_trades')
+        .eq('account_id', account.id).eq('strategy', strategy).maybeSingle();
+      patch.state = 'active';
+      patch.flag_reason = null;
+      patch.flagged_at = null;
+      patch.dismissed_at_trades = Number(row?.closed_trades || 0);
+    } else {
+      throw new Error('Unknown decision: ' + decision);
+    }
+    const { data, error } = await db.from('trader_strategy_review').update(patch)
+      .eq('account_id', account.id).eq('strategy', strategy).select().maybeSingle();
+    if (error) throw error;
+    return data;
+  }
+
   // Upserts a paper trade (open or closed) into trader_paper_trades.
   // trader_paper_trades has: id(uuid, server-generated by default), account_id,
   // strategy, pair, timeframe, direction(BUY|SELL), status(OPEN|CLOSED|CANCELLED),
@@ -3932,7 +4056,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     loadEvolutionAccount: zsLoadEvolutionAccount,
     loadStrategyPool: zsLoadStrategyPool,
     loadEvolutionTrades: zsLoadEvolutionTrades,
-    runEvolutionEngine: zsRunEvolutionEngine
+    runEvolutionEngine: zsRunEvolutionEngine,
+    loadStrategyReview: zsLoadStrategyReview,
+    decideStrategyReview: zsDecideStrategyReview
   };
 
   window.addEventListener('load', async () => {
