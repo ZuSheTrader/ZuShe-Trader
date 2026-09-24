@@ -563,7 +563,7 @@ function paperRiskAllowed(stats,account){
   if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
   return {ok:true};
 }
-const ZS_BUILD='2026-09-24.5';
+const ZS_BUILD='2026-09-24.6';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,20000):1000;}
 function paperPositionSize(balance,entry,stop){
@@ -1180,9 +1180,23 @@ function zsRowToPos(t){
 }
 function zsRowToClosed(t){
   const pl=Number(t.net_pnl)||0;
-  return {...zsRowToPos(t),exit:Number(t.exit_price)||0,pl,closeTime:t.exit_time,status:pl>=0?'Win':'Loss',trigger:t.exit_reason||'Closed'};
+  const grossPl=t.gross_pnl!=null?Number(t.gross_pnl):pl;
+  const fee=Number(t.fees)||0;
+  const slip=Number(t.slippage_cost)||0;
+  return {...zsRowToPos(t),exit:Number(t.exit_price)||0,pl,grossPl,fee,slip,closeTime:t.exit_time,status:pl>=0?'Win':'Loss',trigger:t.exit_reason||'Closed'};
 }
 function zsIsVoided(t){return String(t.exit_reason||'').startsWith('Voided');}
+// ── FEE / SLIPPAGE MODEL (client side — mirrors paper-exit-check edge function) ──
+// Luno's standard tier: maker 0%, taker 0.10% (drops to 0.03% at high 30-day
+// volume) — https://www.luno.com/fees. We assume both legs of a paper trade
+// are taker fills (entry on signal, exit on trigger/manual) and charge the
+// round-trip fee at close, since that is when the real total is known.
+// A manual close uses a live price already, so it only needs a fee + a small
+// spread estimate — not the bigger stop-loss slippage below (that model is
+// for TP/SL, which is only realistic to simulate server-side).
+const ZS_FEE_MODEL={takerFeeRate:0.001,manualSpreadBps:6};
+function zsRoundPrice(p){p=Number(p)||0;if(p<1)return Number(p.toFixed(6));if(p<100)return Number(p.toFixed(4));return Number(p.toFixed(2));}
+function zsRoundTripFee(entryPrice,exitPrice,qty){return Number(((Number(entryPrice)*qty+Number(exitPrice)*qty)*ZS_FEE_MODEL.takerFeeRate).toFixed(2));}
 // Real equity curve from closed trades (oldest first), ending at live equity.
 function zsEquityCurve(account,equity){
   const closed=(account.closedTrades||[]).filter(t=>t.closeTime&&t.status!=='Void').slice().sort((a,b)=>new Date(a.closeTime)-new Date(b.closeTime));
@@ -1862,7 +1876,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
   const closePosition=(posId)=>{
     const pos=account.openPositions.find(p=>p.id===posId);
     if(!pos)return;
-    let pl,exitPrice,status;
+    let pl,exitPrice,status,grossPl=0,fee=0;
     if(pos.paper){
       // Real paper position (opened by the Paper Engine off live Luno data).
       // Manual close uses the last real fetched price, never a random outcome.
@@ -1875,17 +1889,25 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
       if(Math.abs(last/pos.entry-1)>0.5){
         showToast('Price looks wrong for this trade ('+last+' vs entry '+pos.entry+') — not closing. Try again shortly.','warning');return;
       }
-      exitPrice=last;
-      pl=parseFloat(((pos.dir==='BUY'?(last-pos.entry):(pos.entry-last))*(pos.size||0)).toFixed(2));
+      // A manual close is still a taker order crossing the spread, so apply a
+      // small adverse spread estimate to the live tick, then the same
+      // round-trip exchange fee TP/SL fills get — this is what makes the
+      // saved P/L the same "after real costs" number either way.
+      const spreadAdj=1+(ZS_FEE_MODEL.manualSpreadBps/10000)*(pos.dir==='BUY'?-1:1);
+      exitPrice=zsRoundPrice(last*spreadAdj);
+      grossPl=parseFloat(((pos.dir==='BUY'?(exitPrice-pos.entry):(pos.entry-exitPrice))*(pos.size||0)).toFixed(2));
+      fee=zsRoundTripFee(pos.entry,exitPrice,pos.size||0);
+      pl=parseFloat((grossPl-fee).toFixed(2));
       status=pl>=0?'Win':'Loss';
     }else{
       // Demo/simulated position from the illustrative signal desk — clearly
       // labelled DEMO MODE elsewhere in the app, not the real paper engine.
       pl=parseFloat(((Math.random()>.45?1:-1)*pos.risk*(1+Math.random()*2)).toFixed(2));
       exitPrice=pos.dir==='BUY'?pos.entry*(1+(pl>0?.008:-.005)):pos.entry*(1-(pl>0?.008:-.005));
+      grossPl=pl;fee=0;
       status=pl>0?'Win':'Loss';
     }
-    const trade={...pos,exit:parseFloat(exitPrice.toFixed(pos.entry<10?4:2)),pl,closeTime:new Date().toISOString(),status,trigger:pos.paper?'Manual close':undefined};
+    const trade={...pos,exit:parseFloat(exitPrice.toFixed(pos.entry<10?4:2)),pl,grossPl,fee,slip:0,closeTime:new Date().toISOString(),status,trigger:pos.paper?'Manual close':undefined};
     const newBalance=parseFloat((account.balance+pl).toFixed(2));
     const newDailyPL=parseFloat((account.dailyPL+pl).toFixed(2));
     setAccount(a=>({...a,
@@ -1945,6 +1967,15 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
       e('div',{style:{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--text3)'}},
         e('span',null,t.strat||t.strategy||'Manual'),
         e('span',null,dur+' · '+(t.closeTime?new Date(t.closeTime).toLocaleDateString([],{day:'2-digit',month:'short'})+' '+new Date(t.closeTime).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'Today'))
+      ),
+      // Cost breakdown — only shown once a trade actually carries a fee, so
+      // older/legacy rows without one don't render a misleading R0.00 line.
+      (Number(t.fee)>0||Number(t.slip)>0)&&e('div',{style:{display:'flex',justifyContent:'space-between',fontSize:10,color:'var(--text3)',marginTop:3,paddingTop:3,borderTop:'1px dashed var(--border)'}},
+        e('span',null,'Gross '+(t.grossPl>=0?'+':'')+fmtCur(t.grossPl)+
+          (Number(t.slip)>0?' · slip -'+fmtCur(t.slip):'')+
+          ' · fee -'+fmtCur(t.fee)
+        ),
+        e('span',{style:{color:t.pl>=0?'var(--green)':'var(--red)'}},'Net '+(t.pl>=0?'+':'')+fmtCur(t.pl))
       )
     );
   };
@@ -2186,6 +2217,7 @@ function MoreMenu({setSubScreen}){
     {id:'backtest',icon:'🔬',label:'Backtest Arena',sub:'Test any strategy against months of historical price data. See exactly how it would have performed in the past before risking anything.',badge:''},
     {id:'forward',icon:'🧪',label:'Forward Testing',sub:'Validate strategies on fresh market data after backtesting. The final approval gate before a strategy goes live on your demo account.',badge:''},
     {id:'risk',icon:'🛡️',label:'Risk Vault',sub:'Set your personal risk rules — maximum loss per trade, daily loss limits, circuit breakers, and the emergency kill switch.',badge:''},
+    {id:'readiness',icon:'🚀',label:'Live Readiness',sub:'Per-strategy checklist for real money: trade count vs the 50/15 threshold, drawdown, and P/L after fees and slippage.',badge:''},
     {id:'broker',icon:'🔌',label:'Broker Connection',sub:'Future integration: connect your own broker API so approved signals can be executed in your live account with one tap.',badge:'COMING SOON'},
     {id:'settings',icon:'⚙️',label:'Settings',sub:'App preferences, account management, data reset, and version information.',badge:''},
   ];
@@ -2803,127 +2835,360 @@ function RiskVault({riskSettings,setRiskSettings,account,showToast}){
   );
 }
 
-function BrokerConnection({showToast}){
-  const paperOnly=true;
-  const[apiKey,setApiKey]=useState('');
-  const[apiSec,setApiSec]=useState('');
-  const[testing,setTesting]=useState(false);
-  const[liveEnabled,setLiveEnabled]=useState(false);
-  const[approved,setApproved]=useState(true);
+// One strategy's live-readiness read: how far it is from the 50-closed /
+// 15-auto scorekeeper threshold (trader_strategy_review / strategy-review
+// edge function), its fee-and-slippage-adjusted net P/L (net_pnl already has
+// both baked in after paper-exit-check applies them), and its worst
+// peak-to-trough run (max_drawdown) — the three things worth checking before
+// sizing a strategy up with real money, none of which is a live-trading
+// switch by itself.
+const ZS_READY_MIN_TRADES=50,ZS_READY_MIN_AUTO=15;
+function zsReadinessOf(sr){
+  const n=sr.closed_trades||0,auto=sr.auto_trades||0;
+  const netPnl=Number(sr.net_pnl)||0;
+  if(n<ZS_READY_MIN_TRADES||auto<ZS_READY_MIN_AUTO)return{tier:'data',lbl:'Not enough data yet',cls:'pill-purple'};
+  if(sr.verdict==='underperforming')return{tier:'no',lbl:'Losing after fees',cls:'pill-sell'};
+  if(sr.verdict==='manual_only')return{tier:'caution',lbl:'Only profitable via manual exits',cls:'pill-watch'};
+  if(netPnl>0)return{tier:'ready',lbl:'Worth considering',cls:'pill-cyan'};
+  return{tier:'caution',lbl:'Breaking even',cls:'pill-watch'};
+}
+function LiveReadiness({showToast}){
+  const[rows,setRows]=useState([]);
+  const[flags,setFlags]=useState(null);
+  const[loading,setLoading]=useState(false);
 
-  const testConn=async()=>{
-    if(!apiKey){showToast('Enter a broker API key first','warning');return;}
-    setTesting(true);
-    await new Promise(r=>setTimeout(r,1600));
-    setTesting(false);
-    showToast('Connection test simulated — full broker integration requires official API setup','info');
+  const load=useCallback(async()=>{
+    if(!window.ZuShePaperDB)return;
+    setLoading(true);
+    try{
+      const[sr,fl]=await Promise.all([
+        window.ZuShePaperDB.loadStrategyReview(),
+        window.ZuShePaperDB.getSystemFlags().catch(()=>null)
+      ]);
+      setRows(sr||[]);
+      setFlags(fl||null);
+    }catch(err){
+      showToast&&showToast('Could not load live-readiness data: '+(err?.message||err),'error');
+    }finally{
+      setLoading(false);
+    }
+  },[showToast]);
+
+  useEffect(()=>{
+    let cancelled=false,tries=0;
+    const iv=setInterval(()=>{
+      tries++;
+      if(cancelled)return;
+      if(window.ZuShePaperDB||tries>20){clearInterval(iv);load();}
+    },150);
+    return()=>{cancelled=true;clearInterval(iv);};
+  },[load]);
+
+  const withData=rows.filter(sr=>(sr.closed_trades||0)>0);
+  const readyCount=withData.filter(sr=>zsReadinessOf(sr).tier==='ready').length;
+  const liveOn=!!(flags&&flags.live_trading_enabled);
+
+  return e('div',{className:'screen'},
+    e('div',{className:'hdr'},
+      e('div',null,
+        e('div',{style:{fontSize:16,fontWeight:800}},'Live Readiness'),
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,marginTop:1}},'PER-STRATEGY CHECKLIST · FEE-ADJUSTED')
+      ),
+      loading&&e('span',{style:{fontSize:10,color:'var(--text3)'}},'Refreshing…')
+    ),
+    e('div',{className:'scroll'},
+      e('div',{className:'info-banner',style:{marginTop:8}},
+        e('span',null,'🚀'),
+        e('div',null,
+          e('div',{style:{fontWeight:700,marginBottom:2}},'What this checks'),
+          'For each strategy: whether it has the 50 closed trades (15+ by actual TP/SL) the scorekeeper needs to judge it, its net P/L after the same exchange fees and stop-loss slippage a real Luno order would face, and its worst peak-to-trough drawdown. Nothing on this screen turns live trading on — that switch does not exist yet.'
+        )
+      ),
+
+      e('div',{className:'warn-banner'},
+        e('div',{className:'warn-icon'},liveOn?'🟢':'⛔'),
+        e('div',{className:'warn-text'},
+          e('div',{style:{fontWeight:700,marginBottom:3,color:liveOn?'var(--green)':'var(--red)'}},liveOn?'Live Trading Flag: ON':'Live Trading Flag: OFF'),
+          'Broker Connection is still Coming Soon, so no order path exists yet either way — this flag and a connected broker would both be required before a single real trade could be placed.'
+        )
+      ),
+
+      e('div',{className:'stat-grid'},
+        e('div',{className:'stat-box'},
+          e('div',{className:'stat-lbl'},'Strategies Tracked'),
+          e('div',{className:'stat-val stat-neu'},withData.length)
+        ),
+        e('div',{className:'stat-box'},
+          e('div',{className:'stat-lbl'},'Worth Considering'),
+          e('div',{className:'stat-val '+(readyCount>0?'stat-up':'stat-neu')},readyCount)
+        )
+      ),
+
+      e('div',{style:{padding:'4px 4px 8px',fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2}},'STRATEGY BREAKDOWN'),
+      withData.length===0
+        ?e('div',{className:'empty'},
+            e('div',{className:'empty-icon'},'🚀'),
+            e('div',{className:'empty-title'},'No closed trades yet'),
+            e('div',{className:'empty-sub'},'Once strategies start closing trades, their readiness shows up here.')
+          )
+        :withData.map(sr=>{
+            const r=zsReadinessOf(sr);
+            const n=sr.closed_trades||0,auto=sr.auto_trades||0;
+            const tradesLeft=Math.max(0,ZS_READY_MIN_TRADES-n);
+            const autoLeft=Math.max(0,ZS_READY_MIN_AUTO-auto);
+            const netPnl=Number(sr.net_pnl)||0;
+            const dd=Number(sr.max_drawdown)||0;
+            return e('div',{key:sr.strategy,className:'card'},
+              e('div',{className:'row',style:{marginBottom:6}},
+                e('div',{style:{display:'flex',alignItems:'center',gap:8}},
+                  e('span',{style:{fontWeight:700,fontSize:13}},sr.strategy),
+                  e('span',{className:'pill '+r.cls},r.lbl)
+                ),
+                e('span',{style:{fontFamily:'var(--mono)',fontSize:12,fontWeight:700,color:netPnl>=0?'var(--green)':'var(--red)'}},(netPnl>=0?'+':'')+fmtCur(netPnl))
+              ),
+              e('div',{style:{fontSize:10,color:'var(--text3)',marginBottom:8}},'Net P/L after fees + slippage'),
+              e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,background:'var(--glass)',borderRadius:8,padding:'10px',marginBottom:8,textAlign:'center'}},
+                e('div',null,
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'CLOSED'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:13,color:tradesLeft===0?'var(--green)':'var(--text)'}},n+'/'+ZS_READY_MIN_TRADES),
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},tradesLeft===0?'Met':tradesLeft+' to go')
+                ),
+                e('div',{style:{borderLeft:'1px solid var(--border)',borderRight:'1px solid var(--border)'}},
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'AUTO (TP/SL)'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:13,color:autoLeft===0?'var(--green)':'var(--text)'}},auto+'/'+ZS_READY_MIN_AUTO),
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},autoLeft===0?'Met':autoLeft+' to go')
+                ),
+                e('div',null,
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'MAX DRAWDOWN'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:13,color:'var(--amber)'}},fmtCur(dd)),
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'Worst run')
+                )
+              ),
+              e('div',{style:{fontSize:11,color:'var(--text3)',lineHeight:1.5}},
+                (sr.win_rate!=null?Math.round(sr.win_rate)+'% win rate · ':'')+
+                (sr.profit_factor!=null?'profit factor '+Number(sr.profit_factor).toFixed(2):'profit factor n/a')
+              )
+            );
+          })
+    )
+  );
+}
+
+function BrokerConnection({showToast}){
+  const[keyId,setKeyId]=useState('');
+  const[keySecret,setKeySecret]=useState('');
+  const[saving,setSaving]=useState(false);
+  const[keyStatus,setKeyStatus]=useState(null); // {configured, updated_at}
+  const[flags,setFlags]=useState(null);
+  const[capInput,setCapInput]=useState('');
+  const[savingCap,setSavingCap]=useState(false);
+  const[confirmText,setConfirmText]=useState('');
+  const[togglingLive,setTogglingLive]=useState(false);
+  const[orders,setOrders]=useState([]);
+  const[ordersLoading,setOrdersLoading]=useState(false);
+  const[manualPair,setManualPair]=useState('XBTZAR');
+  const[manualDir,setManualDir]=useState('BUY');
+  const[manualZar,setManualZar]=useState('');
+  const[placing,setPlacing]=useState(false);
+
+  const refresh=useCallback(async()=>{
+    if(!window.ZuShePaperDB)return;
+    try{
+      const[ks,fl,ord]=await Promise.all([
+        window.ZuShePaperDB.getTradeKeyStatus(),
+        window.ZuShePaperDB.getSystemFlags(),
+        window.ZuShePaperDB.listLiveOrders().catch(()=>({orders:[]}))
+      ]);
+      setKeyStatus(ks);
+      setFlags(fl);
+      setCapInput(fl&&fl.max_live_order_zar?String(fl.max_live_order_zar):'');
+      setOrders((ord&&ord.orders)||[]);
+    }catch(err){
+      showToast&&showToast('Could not load broker status: '+(err?.message||err),'error');
+    }
+  },[showToast]);
+
+  useEffect(()=>{
+    let cancelled=false,tries=0;
+    const iv=setInterval(()=>{
+      tries++;
+      if(cancelled)return;
+      if(window.ZuShePaperDB||tries>20){clearInterval(iv);refresh();}
+    },150);
+    return()=>{cancelled=true;clearInterval(iv);};
+  },[refresh]);
+
+  const saveKey=async()=>{
+    if(!keyId.trim()||!keySecret.trim()){showToast('Enter both the key ID and secret','warning');return;}
+    setSaving(true);
+    try{
+      const res=await window.ZuShePaperDB.saveTradeKey(keyId.trim(),keySecret.trim());
+      if(res&&res.error){showToast(res.error,'error');}
+      else{showToast('Trading key verified and saved','success');setKeyId('');setKeySecret('');await refresh();}
+    }catch(err){showToast('Could not save key: '+(err?.message||err),'error');}
+    setSaving(false);
   };
+  const clearKey=async()=>{
+    if(!window.confirm('Remove the stored trading API key? Live orders will be blocked until a new one is added.'))return;
+    try{await window.ZuShePaperDB.clearTradeKey();showToast('Trading key removed','info');await refresh();}
+    catch(err){showToast('Could not remove key: '+(err?.message||err),'error');}
+  };
+
+  const saveCap=async()=>{
+    const v=Number(capInput);
+    if(!Number.isFinite(v)||v<0){showToast('Enter a valid ZAR amount (0 to disable)','warning');return;}
+    setSavingCap(true);
+    try{
+      await window.ZuShePaperDB.updateSystemFlags({max_live_order_zar:v});
+      showToast(v>0?'Max live order size saved':'Live orders disabled (cap set to 0)','success');
+      await refresh();
+    }catch(err){showToast('Could not save: '+(err?.message||err),'error');}
+    setSavingCap(false);
+  };
+
+  const canEnableLive=keyStatus&&keyStatus.configured&&flags&&Number(flags.max_live_order_zar)>0;
+  const toggleLive=async(turnOn)=>{
+    if(turnOn){
+      if(!canEnableLive){showToast('Add a verified trading key and set a max order size first','warning');return;}
+      if(confirmText.trim().toUpperCase()!=='ENABLE LIVE TRADING'){showToast('Type the confirmation phrase exactly to enable live trading','warning');return;}
+      if(!window.confirm('This allows real orders to be placed on your Luno account (up to your max order size, one at a time, only when you tap Place Order below). Continue?'))return;
+    }
+    setTogglingLive(true);
+    try{
+      await window.ZuShePaperDB.updateSystemFlags({live_trading_enabled:turnOn,live_trading_confirmed_at:turnOn?new Date().toISOString():null});
+      showToast(turnOn?'Live trading enabled':'Live trading disabled','success');
+      setConfirmText('');
+      await refresh();
+    }catch(err){showToast('Could not update: '+(err?.message||err),'error');}
+    setTogglingLive(false);
+  };
+
+  const placeOrder=async()=>{
+    const zar=Number(manualZar);
+    if(!Number.isFinite(zar)||zar<=0){showToast('Enter a ZAR amount to spend/sell','warning');return;}
+    if(!window.confirm(`Place a REAL ${manualDir} order on Luno for ${manualPair}, sized ~R${zar.toFixed(2)}? This uses real money.`))return;
+    setPlacing(true);
+    try{
+      const res=await window.ZuShePaperDB.placeLiveOrder(manualPair,manualDir,zar);
+      if(res&&res.error){showToast(res.error,'error');}
+      else{showToast('Live order submitted to Luno','success');setManualZar('');await refresh();}
+    }catch(err){showToast('Order failed: '+(err?.message||err),'error');}
+    setPlacing(false);
+  };
+
+  const liveOn=!!(flags&&flags.live_trading_enabled);
+  const killSwitch=!!(flags&&flags.kill_switch_active);
 
   return e('div',{className:'screen'},
     e('div',{className:'hdr'},
       e('div',null,
         e('div',{style:{fontSize:16,fontWeight:800}},'Broker Connection'),
-        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,marginTop:1}},'FUTURE LIVE TRADING INTEGRATION')
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,marginTop:1}},'LUNO · REAL MONEY WHEN ENABLED')
       )
     ),
     e('div',{className:'scroll'},
       e('div',{className:'warn-banner',style:{marginTop:8}},
-        e('div',{className:'warn-icon'},'⛔'),
+        e('div',{className:'warn-icon'},liveOn?'🟢':'⛔'),
         e('div',{className:'warn-text'},
-          e('div',{style:{fontWeight:700,marginBottom:3,color:'var(--red)'}},'Live Trading is Currently Disabled'),
-          'This screen is a placeholder for future broker API integration. No real trades will ever be executed without your explicit approval AND a properly configured broker API connection. ZuShé Trader never touches real money by default.'
+          e('div',{style:{fontWeight:700,marginBottom:3,color:liveOn?'var(--green)':'var(--red)'}},liveOn?'Live Trading is ON':'Live Trading is OFF'),
+          killSwitch?'The kill switch is also active — no live order will be accepted regardless of this setting.'
+            :'Every gate below (key, cap, this toggle) is re-checked on the server before any order reaches Luno — nothing fires just because the app says it would.'
         )
       ),
 
-      e('div',{className:'info-banner'},
-        e('span',null,'🔌'),
-        e('div',null,
-          e('div',{style:{fontWeight:700,marginBottom:2}},'What is Broker Connection for?'),
-          'In the future, you will be able to connect your own personal broker account (like OANDA, Interactive Brokers, or a crypto exchange) via their official API. When connected, you can tap "Approve" on a signal and ZuShé will send the order directly to your broker. You always retain full control — no trade executes without your explicit approval.'
-        )
-      ),
-
-      // Status
       e('div',{className:'card'},
-        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:12}},'CONNECTION STATUS'),
-        e('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:14,background:'var(--red-dim)',border:'1px solid rgba(255,61,90,.2)',borderRadius:10,padding:'12px 14px'}},
-          e('div',{style:{fontSize:28}},'🔴'),
-          e('div',null,
-            e('div',{style:{fontWeight:700,fontSize:14,color:'var(--red)'}},'No Broker Connected'),
-            e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2}},'Currently running in Demo Mode only — all trading uses your simulated R1,000 account')
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:12}},'1 · TRADING API KEY'),
+        keyStatus&&keyStatus.configured
+          ?e('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:12,background:'var(--glass)',borderRadius:10,padding:'12px 14px'}},
+              e('div',{style:{fontSize:24}},'🟢'),
+              e('div',null,
+                e('div',{style:{fontWeight:700,fontSize:13}},'Trading key configured'),
+                e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2}},keyStatus.updated_at?('Saved '+new Date(keyStatus.updated_at).toLocaleString()):'')
+              )
+            )
+          :e('div',{style:{fontSize:12,color:'var(--text3)',marginBottom:12,lineHeight:1.6}},'No trading key saved yet. Create a Luno API key with Balance + Trading permissions (never Withdraw) and paste it below — it is verified against Luno before saving and is never shown again.'),
+        !(keyStatus&&keyStatus.configured)&&e('div',null,
+          e('div',{style:{marginBottom:10}},
+            e('div',{style:{fontSize:12,fontWeight:600,marginBottom:3}},'API Key ID'),
+            e('input',{className:'inp',type:'text',placeholder:'e.g. abcd1234...',value:keyId,onChange:ev=>setKeyId(ev.target.value)})
+          ),
+          e('div',{style:{marginBottom:12}},
+            e('div',{style:{fontSize:12,fontWeight:600,marginBottom:3}},'API Key Secret'),
+            e('input',{className:'inp',type:'password',placeholder:'Paste the secret here...',value:keySecret,onChange:ev=>setKeySecret(ev.target.value)})
+          ),
+          e('button',{className:'btn btn-ghost',onClick:saveKey,disabled:saving},
+            saving?e('span',{style:{display:'flex',alignItems:'center',gap:8}},e('div',{className:'spinner'}),'Verifying with Luno...'):'🔒 Verify & Save Key'
           )
         ),
-        e('div',{style:{fontSize:12,color:'var(--text2)',lineHeight:1.6,marginBottom:12}},'To connect a broker, you will need to create an API key in your broker dashboard. The key gives ZuShé Trader permission to place orders on your behalf. Always use the minimum required permissions and never share your API secret with anyone.'),
-        e('div',{style:{marginBottom:10}},
-          e('div',{style:{fontSize:12,fontWeight:600,marginBottom:3}},'Broker API Key'),
-          e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:6}},'Found in your broker account settings or developer section. Starts with a unique prefix depending on the broker.'),
-          e('input',{className:'inp',type:'password',placeholder:'Paste your broker API key here...',value:apiKey,onChange:ev=>setApiKey(ev.target.value)})
-        ),
-        e('div',{style:{marginBottom:12}},
-          e('div',{style:{fontSize:12,fontWeight:600,marginBottom:3}},'API Secret / Password'),
-          e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:6}},'The secret is generated alongside your API key. Keep it secure — treat it like a password. It is stored locally on your device and never sent to any server.'),
-          e('input',{className:'inp',type:'password',placeholder:'Paste your API secret here...',value:apiSec,onChange:ev=>setApiSec(ev.target.value)})
-        ),
-        e('div',{style:{background:'var(--cyan-dim)',border:'1px solid rgba(0,229,204,.2)',borderRadius:8,padding:'10px 12px',marginBottom:12,fontSize:11,color:'var(--text2)',lineHeight:1.5}},
-          '🔒 Your API keys are stored locally on your device only. They are never uploaded to any server, cloud, or third party. Use read-only permissions where possible for extra security.'
-        ),
-        e('button',{className:'btn btn-ghost',onClick:testConn,disabled:testing},
-          testing
-            ?e('span',{style:{display:'flex',alignItems:'center',gap:8}},e('div',{className:'spinner'}),'Testing connection...')
-            :'🔌 Test Connection'
-        )
+        keyStatus&&keyStatus.configured&&e('button',{className:'btn btn-ghost',onClick:clearKey},'Remove Key')
       ),
 
-      // Live controls
-      e('div',{className:'settings-section'},
-        e('div',{className:'settings-hdr'},'Live Trading Controls'),
-        e('div',{style:{padding:'12px 14px',borderBottom:'1px solid var(--border)'}},
-          e('div',{className:'row'},
-            e('div',null,
-              e('div',{style:{fontSize:13,fontWeight:600}},'Live Trade Execution — LOCKED IN V1'),
-              e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2,lineHeight:1.5}},'Allow ZuShé to send orders to your connected broker. This will be disabled until a broker is successfully connected. Even when enabled, every trade requires your manual approval.')
-            ),
-            e('label',{className:'sw'},
-              e('input',{type:'checkbox',checked:liveEnabled,onChange:ev=>{setLiveEnabled(ev.target.checked);if(ev.target.checked)showToast('Connect a broker first before enabling live trading','warning');}}),
-              e('span',{className:'sw-slider'})
-            )
-          )
-        ),
-        e('div',{style:{padding:'12px 14px',borderBottom:'1px solid var(--border)'}},
-          e('div',{className:'row'},
-            e('div',null,
-              e('div',{style:{fontSize:13,fontWeight:600}},'Require Manual Approval for Every Trade'),
-              e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2,lineHeight:1.5}},'STRONGLY RECOMMENDED: ON. When ON, you must tap "Approve" on each signal before any order is sent to your broker. When OFF, signals that meet all criteria would execute automatically — not recommended.')
-            ),
-            e('label',{className:'sw'},
-              e('input',{type:'checkbox',checked:approved,onChange:ev=>setApproved(ev.target.checked)}),
-              e('span',{className:'sw-slider'})
-            )
-          )
-        )
-      ),
-
-      // Planned workflow
       e('div',{className:'card'},
-        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--amber)',letterSpacing:2,marginBottom:12}},'PLANNED EXECUTION WORKFLOW'),
-        e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:12,lineHeight:1.6}},'Once a broker is connected, here is how a live trade will work:'),
-        ...[
-          {n:'1',t:'AI Identifies a Setup',d:'A deployed strategy detects a valid trade opportunity matching its rules on your chosen market and timeframe.'},
-          {n:'2',t:'Full Signal Proposal Generated',d:'ZuShé creates a complete trade proposal including entry, stop loss, take profit, position size, and AI reasoning.'},
-          {n:'3',t:'You Review the Signal',d:'The signal appears in your Signal Desk. You read the full analysis including AI confidence, risk-reward, and reasoning.'},
-          {n:'4',t:'You Approve the Trade',d:'You tap "Accept". Only at this moment does ZuShé send the order to your broker. No approval = no trade.'},
-          {n:'5',t:'Broker Executes the Order',d:'Your official broker places the order in the real market. ZuShé records the execution details and begins monitoring.'},
-          {n:'6',t:'ZuShé Tracks the Result',d:'The trade is logged to your journal with full details. When it closes, your strategy performance record is updated.'},
-        ].map(({n,t,d})=>e('div',{key:n,style:{display:'flex',gap:12,paddingBottom:10,marginBottom:10,borderBottom:'1px solid var(--border)'}},
-          e('div',{style:{width:26,height:26,borderRadius:13,background:'var(--cyan-dim)',border:'1px solid rgba(0,229,204,.3)',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:'var(--mono)',fontSize:11,fontWeight:700,color:'var(--cyan)',flexShrink:0}},n),
-          e('div',null,
-            e('div',{style:{fontWeight:600,fontSize:13,marginBottom:2}},t),
-            e('div',{style:{fontSize:11,color:'var(--text3)',lineHeight:1.5}},d)
-          )
-        ))
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:12}},'2 · MAX LIVE ORDER SIZE'),
+        e('div',{style:{fontSize:12,color:'var(--text3)',marginBottom:10,lineHeight:1.6}},'A hard cap enforced server-side on every order, independent of the toggle below. Set to 0 to block all live orders regardless of anything else.'),
+        e('div',{style:{display:'flex',gap:8}},
+          e('input',{className:'inp',type:'number',placeholder:'0',value:capInput,onChange:ev=>setCapInput(ev.target.value),style:{flex:1}}),
+          e('button',{className:'btn btn-ghost',onClick:saveCap,disabled:savingCap},savingCap?'Saving...':'Save')
+        ),
+        flags&&e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:8}},'Current cap: R'+(Number(flags.max_live_order_zar)||0).toFixed(2))
       ),
 
-      e('div',{className:'disc'},'Live execution is entirely your responsibility. ZuShé Trader does not execute any trade without your explicit approval. No real money is involved until you connect a broker and enable live trading.')
+      e('div',{className:'card'},
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:12}},'3 · LIVE TRADING SWITCH'),
+        e('div',{style:{fontSize:12,color:'var(--text3)',marginBottom:12,lineHeight:1.6}},
+          canEnableLive?'':'Locked until a verified key is saved and a max order size above R0 is set.'),
+        e('div',{className:'row',style:{marginBottom:liveOn?0:12}},
+          e('div',null,
+            e('div',{style:{fontSize:13,fontWeight:600}},'Live Trading'),
+            e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2}},liveOn?'Orders can be placed manually below.':'Off — nothing can be sent to Luno.')
+          ),
+          e('label',{className:'sw'},
+            e('input',{type:'checkbox',checked:liveOn,disabled:togglingLive||(!liveOn&&!canEnableLive),onChange:ev=>toggleLive(ev.target.checked)}),
+            e('span',{className:'sw-slider'})
+          )
+        ),
+        !liveOn&&canEnableLive&&e('div',null,
+          e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:6}},'Type ENABLE LIVE TRADING to confirm, then flip the switch above:'),
+          e('input',{className:'inp',type:'text',placeholder:'ENABLE LIVE TRADING',value:confirmText,onChange:ev=>setConfirmText(ev.target.value)})
+        )
+      ),
+
+      liveOn&&!killSwitch&&e('div',{className:'card'},
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--amber)',letterSpacing:2,marginBottom:12}},'MANUAL LIVE ORDER'),
+        e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:12,lineHeight:1.6}},'Not connected to any signal or strategy — this places a real market order on Luno only when you tap the button, for testing the pipeline or acting on your own judgment.'),
+        e('div',{style:{display:'flex',gap:8,marginBottom:8}},
+          e('select',{className:'inp',value:manualPair,onChange:ev=>setManualPair(ev.target.value),style:{flex:1}},
+            ['XBTZAR','ETHZAR','XRPZAR'].map(p=>e('option',{key:p,value:p},p))
+          ),
+          e('select',{className:'inp',value:manualDir,onChange:ev=>setManualDir(ev.target.value),style:{flex:1}},
+            e('option',{value:'BUY'},'BUY'),e('option',{value:'SELL'},'SELL')
+          )
+        ),
+        e('div',{style:{display:'flex',gap:8}},
+          e('input',{className:'inp',type:'number',placeholder:'ZAR amount',value:manualZar,onChange:ev=>setManualZar(ev.target.value),style:{flex:1}}),
+          e('button',{className:'btn btn-red',onClick:placeOrder,disabled:placing},placing?'Placing...':'Place Order')
+        )
+      ),
+
+      e('div',{style:{padding:'4px 4px 8px',fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2}},'RECENT LIVE ORDERS'),
+      orders.length===0
+        ?e('div',{className:'empty'},
+            e('div',{className:'empty-icon'},'🔌'),
+            e('div',{className:'empty-title'},'No live orders yet'),
+            e('div',{className:'empty-sub'},'Everything so far has been paper trading — this list stays empty until a real order is placed.')
+          )
+        :orders.map(o=>e('div',{key:o.id,className:'card',style:{padding:'10px 14px'}},
+            e('div',{className:'row'},
+              e('span',{style:{fontWeight:700,fontSize:12}},o.direction+' '+o.pair),
+              e('span',{className:'pill '+(o.status==='submitted'?'pill-cyan':'pill-sell')},o.status)
+            ),
+            e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:4}},
+              'R'+Number(o.requested_zar).toFixed(2)+(o.luno_order_id?' · order '+o.luno_order_id:'')+' · '+new Date(o.created_at).toLocaleString()
+            ),
+            o.error&&e('div',{style:{fontSize:11,color:'var(--red)',marginTop:4}},o.error)
+          )),
+
+      e('div',{className:'disc'},'Real broker orders bypass the paper account entirely — they use real ZAR on your Luno account. The max order size and live trading switch are enforced server-side on every request, not just in this screen.')
     )
   );
 }
@@ -3374,16 +3639,15 @@ function App(){
   });
   const[showToast,ToastContainer]=useToast();
   const[livePrices,setLivePrices]=useState({});
-  // Keep a live reference so background price polling never closes trades
-  // against a stale React render of the account.
-  const accountRef=useRef(account);
-  accountRef.current=account;
-  const closingPaperIds=useRef(new Set());
 
-  // Live mark-to-market + automatic paper exits. Every open paper position is
-  // checked against a fresh Luno ticker on the pair's polling cycle. This is
-  // independent of the Paper Engine's optional Auto switch, so TP/SL protection
-  // continues working even when the user is on another screen.
+  // Live mark-to-market: poll the last-traded price for every pair with an
+  // open position, plus every pair with a live (non-rejected) signal on
+  // the Signal Desk (every 60s, plus immediately whenever that pair set
+  // changes) so both Equity and the Signal Desk's Current Price field
+  // reflect the real market instead of a stale/absent value. This never
+  // touches account.balance/equity in state — those stay server-
+  // authoritative, updated only when a position actually closes
+  // (checkExits / paper-exit-check).
   const livePairSet=[...new Set([
     ...(account.openPositions||[]).map(p=>p.pair),
     ...signals.filter(s=>s.status!=='Rejected').map(s=>s.pair)
@@ -3402,65 +3666,14 @@ function App(){
         }catch(_e){ return [pair,null]; }
       }));
       if(cancelled)return;
-
-      const prices={};
-      entries.forEach(([pair,last])=>{ if(last)prices[pair]=last; });
-      setLivePrices(prev=>({...prev,...prices}));
-
-      // Hard exit check: do this from the same fresh ticker data used for
-      // mark-to-market. A trade whose TP/SL has already been crossed must not
-      // remain displayed as OPEN simply because the user has not pressed
-      // Evaluate or enabled the optional Paper Engine Auto switch.
-      const db=window.ZuShePaperDB;
-      const openNow=(accountRef.current.openPositions||[]).filter(p=>p.paper&&p.dbId);
-      for(const pos of openNow){
-        const last=prices[pos.pair];
-        if(!last)continue;
-        const exit=evaluatePaperExit(pos,last);
-        if(!exit||closingPaperIds.current.has(pos.dbId))continue;
-        closingPaperIds.current.add(pos.dbId);
-        try{
-          const pl=parseFloat(((pos.dir==='BUY'
-            ?(exit.exitPrice-pos.entry)
-            :(pos.entry-exit.exitPrice))*(pos.size||0)).toFixed(2));
-          const trade={...pos,exit:exit.exitPrice,pl,
-            closeTime:new Date().toISOString(),
-            status:exit.status,trigger:exit.trigger};
-
-          if(db?.closeTrade) await db.closeTrade(trade);
-          recordPaperTradeResult(pl);
-          setAccount(a=>{
-            const stillOpen=(a.openPositions||[]).some(p=>p.dbId===pos.dbId);
-            if(!stillOpen)return a;
-            const newBalance=parseFloat((Number(a.balance||0)+pl).toFixed(2));
-            return {...a,
-              balance:newBalance,
-              equity:newBalance,
-              dailyPL:parseFloat((Number(a.dailyPL||0)+pl).toFixed(2)),
-              openPositions:(a.openPositions||[]).filter(p=>p.dbId!==pos.dbId),
-              closedTrades:[trade,...(a.closedTrades||[])],
-              used:parseFloat(Math.max(0,(a.used||0)-Number(pos.risk||0)).toFixed(2))
-            };
-          });
-          if(db?.recomputeAccount){
-            const remote=await db.recomputeAccount();
-            if(remote&&Number.isFinite(Number(remote.balance))){
-              setAccount(a=>({...a,
-                balance:Number(remote.balance),
-                equity:Number(remote.balance),
-                dailyPL:Number(remote.daily_pnl)||0
-              }));
-            }
-          }
-        }catch(err){
-          console.warn('[ZuShé Trader] automatic paper exit failed:',err?.message||err);
-        }finally{
-          closingPaperIds.current.delete(pos.dbId);
-        }
-      }
+      setLivePrices(prev=>{
+        const next={...prev};
+        entries.forEach(([pair,last])=>{ if(last)next[pair]=last; });
+        return next;
+      });
     };
     fetchAll();
-    const iv=setInterval(fetchAll,30000);
+    const iv=setInterval(fetchAll,60000);
     return()=>{cancelled=true;clearInterval(iv);};
   },[openPairsKey]);
 
@@ -3483,6 +3696,7 @@ function App(){
   // Server is the source of truth. On load, every 60s and whenever the tab becomes visible:
   // rebuild balance, open positions and closed trades from Supabase, and self-heal the server
   // balance if it ever disagrees with the sum of closed trades.
+  const accountRef=useRef(account);accountRef.current=account;
   const syncFromServer=useCallback(async()=>{
     const db=window.ZuShePaperDB; if(!db?.ensureAccount)return;
     try{
@@ -3589,6 +3803,7 @@ function App(){
     backtest:e(BacktestArena,{strategies}),
     forward:e(ForwardTest,{strategies,setStrategies,showToast}),
     risk:e(RiskVault,{riskSettings,setRiskSettings,account,showToast}),
+    readiness:e(LiveReadiness,{showToast}),
     broker:e(BrokerConnection,{showToast}),
     settings:e(AppSettings,{showToast,onLogout:logout,account,setAccount}),
   };
@@ -3609,7 +3824,7 @@ function App(){
         e('div',{style:{display:'flex',alignItems:'center',gap:10,padding:'14px 16px 10px',background:'rgba(8,12,11,.95)',backdropFilter:'blur(20px)',borderBottom:'1px solid var(--border)'}},
           e('button',{onClick:()=>setSubScreen(null),style:{background:'var(--glass2)',border:'1px solid var(--border)',borderRadius:8,width:34,height:34,color:'var(--text)',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',fontSize:18,flexShrink:0}},'←'),
           e('div',{style:{fontSize:15,fontWeight:700,color:'var(--text)'}},
-            {journal:'Trade Journal',backtest:'Backtest Arena',forward:'Forward Testing',risk:'Risk Vault',broker:'Broker Connection',settings:'Settings'}[subScreen]||subScreen
+            {journal:'Trade Journal',backtest:'Backtest Arena',forward:'Forward Testing',risk:'Risk Vault',readiness:'Live Readiness',broker:'Broker Connection',settings:'Settings'}[subScreen]||subScreen
           )
         )
       ),
@@ -3958,12 +4173,17 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     const db = zsInitSupabase();
     if (!db || !trade || !trade.dbId) return;
     const pl = Number(trade.pl || 0);
+    const grossPl = trade.grossPl != null ? Number(trade.grossPl) : pl;
+    const fee = Number(trade.fee || 0);
+    const slip = Number(trade.slip || 0);
     const payload = {
       status: 'CLOSED',
       exit_price: Number(trade.exit) || null,
       exit_time: trade.closeTime ? new Date(trade.closeTime).toISOString() : new Date().toISOString(),
       exit_reason: trade.trigger || trade.exitReason || 'Manual close',
-      gross_pnl: pl,
+      gross_pnl: grossPl,
+      fees: fee,
+      slippage_cost: slip,
       net_pnl: pl
     };
     const ent = Number(trade.entry), ex = Number(trade.exit);
@@ -4050,6 +4270,44 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
   const zsGetSecretStatus = (name) => zsSecretCall({ action: 'status', name });
   const zsSaveSecret = (name, value) => zsSecretCall({ action: 'set', name, value });
   const zsClearSecret = (name) => zsSecretCall({ action: 'clear', name });
+
+  // ---- Broker Connection (real, but nothing auto-fires) -----------------
+  // Trading key: id+secret verified against Luno's own /api/1/balance by
+  // save-secret before it is stored, same write-only pattern as the Gemini
+  // key above — the app can only ever ask "is it configured?".
+  const zsSaveTradeKey = (id, secret) => zsSaveSecret('luno_trade_key', JSON.stringify({ id, secret }));
+  const zsGetTradeKeyStatus = () => zsGetSecretStatus('luno_trade_key');
+  const zsClearTradeKey = () => zsClearSecret('luno_trade_key');
+
+  // trader_system_flags is world-writable to this single-user app already
+  // (see saveLunoKey above) — the live-trading gates that actually matter
+  // (kill switch, live_trading_enabled, the order cap, whether a trading
+  // key exists) are re-checked server-side in broker-order regardless of
+  // what the client sends, so this is just the same direct-upsert pattern
+  // everything else in Settings already uses.
+  async function zsUpdateSystemFlags(patch) {
+    const db = zsInitSupabase();
+    if (!db) throw new Error('Supabase not available');
+    const { error } = await db.from('trader_system_flags')
+      .upsert({ owner_key: ZS_SYSTEM_KEY, ...patch }, { onConflict: 'owner_key' });
+    if (error) throw error;
+  }
+
+  async function zsBrokerCall(payload) {
+    const res = await fetch(`${ZS_SUPABASE_URL}/functions/v1/broker-order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok && !j.error) j.error = 'HTTP ' + res.status;
+    return j;
+  }
+  // Every real-money gate (kill switch, live_trading_enabled, order cap,
+  // key presence) is enforced again inside broker-order itself — this call
+  // cannot skip them just because the client thinks it's ready.
+  const zsPlaceLiveOrder = (pair, direction, zarAmount) => zsBrokerCall({ action: 'place', pair, direction, zar_amount: zarAmount });
+  const zsListLiveOrders = () => zsBrokerCall({ action: 'list' });
 
   async function zsPersistAccount(patch) {
     const db = zsInitSupabase();
@@ -4185,7 +4443,13 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     loadEvolutionTrades: zsLoadEvolutionTrades,
     runEvolutionEngine: zsRunEvolutionEngine,
     loadStrategyReview: zsLoadStrategyReview,
-    decideStrategyReview: zsDecideStrategyReview
+    decideStrategyReview: zsDecideStrategyReview,
+    saveTradeKey: zsSaveTradeKey,
+    getTradeKeyStatus: zsGetTradeKeyStatus,
+    clearTradeKey: zsClearTradeKey,
+    updateSystemFlags: zsUpdateSystemFlags,
+    placeLiveOrder: zsPlaceLiveOrder,
+    listLiveOrders: zsListLiveOrders
   };
 
   window.addEventListener('load', async () => {
