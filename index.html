@@ -53,7 +53,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 
 /* ── Scrollable content ── */
 .screen{height:100vh;display:flex;flex-direction:column;overflow:hidden}
-.scroll{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding-bottom:80px}
+.scroll{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding-bottom:calc(104px + env(safe-area-inset-bottom,0px))}
 .scroll::-webkit-scrollbar{display:none}
 
 /* ── App shell ── */
@@ -80,7 +80,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 /* ── Bottom nav ── */
 .nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:480px;
   background:rgba(8,12,11,.95);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
-  border-top:1px solid var(--border);z-index:100;padding:0;display:flex}
+  border-top:1px solid var(--border);z-index:100;padding:0 0 env(safe-area-inset-bottom,0px);display:flex}
 .nb{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
   padding:10px 4px 14px;border:none;background:none;color:var(--text3);
   font-family:var(--font);font-size:9px;font-weight:700;letter-spacing:.4px;
@@ -369,7 +369,7 @@ const PAPER_CONFIG={
     {id:'LTCZAR',label:'LTC/ZAR'}
   ],
   timeframe:3600,
-  startingBalance:1000,
+  startingBalance:10000,
   riskPerTrade:0.01,
   maxDailyLoss:0.03,
   maxOpenTrades:1,
@@ -563,9 +563,9 @@ function paperRiskAllowed(stats,account){
   if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
   return {ok:true};
 }
-const ZS_BUILD='2026-09-25.1';
+const ZS_BUILD='2026-09-25.2';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
-function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,20000):1000;}
+function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
 function paperPositionSize(balance,entry,stop){
   const risk=paperSizingBalance(balance)*PAPER_CONFIG.riskPerTrade;
   const distance=Math.abs(entry-stop);
@@ -657,7 +657,11 @@ const STRATS_SEED=[
   {id:'s5',name:'Breakout Hunter NAS',family:'Breakout',version:'v4.0',score:82,status:'Demo Active',winRate:63,pf:2.10,dd:7.1,trades:201,tf:'H1',market:'NAS100'},
 ];
 
-const DEMO_ACCOUNT_SEED={balance:1000,equity:1000,used:0,currency:'ZAR',dailyPL:0,weeklyPL:0,monthlyPL:0,totalReturn:0,dd:0,openPositions:[],closedTrades:[]};
+const DEMO_ACCOUNT_SEED={balance:10000,equity:10000,used:0,currency:'ZAR',dailyPL:0,weeklyPL:0,monthlyPL:0,totalReturn:0,dd:0,openPositions:[],closedTrades:[],starting_balance:10000};
+// Resolves the real baseline for % return / Total P-L math — the account's own
+// starting_balance when known (so a manual balance top-up is never counted as
+// "return"), falling back to the demo seed only if it truly isn't set yet.
+function zsStartBal(account){const n=Number(account&&account.starting_balance);return Number.isFinite(n)&&n>0?n:DEMO_ACCOUNT_SEED.balance;}
 
 const JOURNAL_SEED=[
   {id:'j1',date:'2024-01-15',market:'XAU/USD',dir:'BUY',entry:2290.10,exit:2318.45,sl:2278,tp:2320,size:0.05,risk:100,pl:141.75,strat:'Momentum Surge',conf:81,status:'Win',notes:'Clean trend entry. Held through pullback.',tags:['trend','gold']},
@@ -1000,7 +1004,7 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,li
   const pendingSigs=signals.filter(s=>s.status==='Pending').length;
   const equity=liveEquity!=null?liveEquity:account.balance;
   const equityData=zsEquityCurve(account,equity);
-  const totalReturn=((account.balance-1000)/1000*100);
+  const totalReturn=((account.balance-zsStartBal(account))/zsStartBal(account)*100);
 
   return e('div',{className:'screen'},
     e('div',{className:'hdr'},
@@ -1038,10 +1042,10 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,li
       ),
 
       // ── Account overview ──
-      e('div',{className:'stit'},'Your Demo Account',e('span',null,'R1,000 STARTING CAPITAL')),
+      e('div',{className:'stit'},'Your Demo Account',e('span',null,'R10,000 STARTING CAPITAL')),
       e('div',{className:'stat-grid'},
         e('div',{className:'stat-box'},
-          e('div',{className:'stat-lbl'},e(HelpLabel,{label:'Demo Balance',help:'Your current simulated account balance. Starts at R1,000. Increases when demo trades win, decreases when they lose. This is not real money — it is a risk-free simulation.'})),
+          e('div',{className:'stat-lbl'},e(HelpLabel,{label:'Demo Balance',help:'Your current simulated account balance. Starts at R10,000. Increases when demo trades win, decreases when they lose. This is not real money — it is a risk-free simulation.'})),
           e('div',{className:'stat-val stat-neu'},fmtCur(account.balance)),
           e('div',{className:'stat-sub',style:{color:totalReturn>=0?'var(--green)':'var(--red)'}},
             (totalReturn>=0?'▲':'▼'),Math.abs(totalReturn).toFixed(2),'% all time')
@@ -1051,7 +1055,7 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,li
           e('div',{className:'stat-val '+(account.dailyPL>=0?'stat-up':'stat-dn')},
             (account.dailyPL>=0?'+':'')+fmtCur(account.dailyPL)
           ),
-          e('div',{className:'stat-sub'},account.dailyPL===0?'No trades closed today':fmtPct(account.dailyPL/(account.balance||1000)*100)+' of balance')
+          e('div',{className:'stat-sub'},account.dailyPL===0?'No trades closed today':fmtPct(account.dailyPL/(account.balance||zsStartBal(account))*100)+' of balance')
         ),
         e('div',{className:'stat-box'},
           e('div',{className:'stat-lbl'},e(HelpLabel,{label:'Open Positions',help:'How many demo trades are currently open. Each open position is using some of your balance as margin. Monitor these in the Portfolio tab. Your Risk Vault limits how many can be open at once.'})),
@@ -1070,7 +1074,7 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,li
         e('div',{className:'row',style:{marginBottom:6}},
           e('div',null,
             e('div',{style:{fontWeight:700,fontSize:13}},'Account Equity Curve'),
-            e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:1}},'How your R1,000 demo balance has changed over time')
+            e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:1}},'How your R10,000 demo balance has changed over time')
           ),
           e('div',{style:{textAlign:'right'}},
             e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,color:'var(--cyan)',fontSize:15}},fmtCur(equity)),
@@ -1200,7 +1204,8 @@ function zsRoundTripFee(entryPrice,exitPrice,qty){return Number(((Number(entryPr
 // Real equity curve from closed trades (oldest first), ending at live equity.
 function zsEquityCurve(account,equity){
   const closed=(account.closedTrades||[]).filter(t=>t.closeTime&&t.status!=='Void').slice().sort((a,b)=>new Date(a.closeTime)-new Date(b.closeTime));
-  let bal=1000;const pts=[1000];
+  const seed=Number(account.starting_balance)||DEMO_ACCOUNT_SEED.balance;
+  let bal=seed;const pts=[seed];
   closed.forEach(t=>{bal+=Number(t.pl)||0;pts.push(parseFloat(bal.toFixed(2)));});
   pts.push(equity);
   return pts.slice(-60);
@@ -1248,6 +1253,20 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   const accepted=bySource.filter(s=>s.status==='Accepted');
   const rejected=bySource.filter(s=>s.status==='Rejected');
   const watching=bySource.filter(s=>s.status==='Watching');
+
+  // An "Accepted" signal can now be in one of four real states — split it
+  // by cross-referencing the signal id against the live open positions and
+  // closed trades, rather than leaving everything lumped under one label.
+  const openSigIds=useMemo(()=>new Set((account.openPositions||[]).filter(p=>p.sigId).map(p=>p.sigId)),[account.openPositions]);
+  const closedSigBucket=useMemo(()=>{
+    const m={};
+    (account.closedTrades||[]).forEach(t=>{ if(t.sigId&&!(t.sigId in m))m[t.sigId]=zsExitBucket(t); });
+    return m;
+  },[account.closedTrades]);
+  const acceptedOpen=accepted.filter(s=>openSigIds.has(s.id)||!(s.id in closedSigBucket));
+  const acceptedClosedTp=accepted.filter(s=>closedSigBucket[s.id]==='tp');
+  const acceptedClosedSl=accepted.filter(s=>closedSigBucket[s.id]==='sl');
+  const acceptedClosedManual=accepted.filter(s=>closedSigBucket[s.id]==='manual');
 
   // Downscale to max 1600px JPEG so phone screenshots stay well under API/body limits.
   const fileToBase64=(file)=>new Promise((resolve,reject)=>{
@@ -1345,11 +1364,14 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
 
   const tabs=[
     {id:'pending',lbl:'Pending',cnt:pending.length,desc:'Waiting for your decision'},
-    {id:'accepted',lbl:'Accepted',cnt:accepted.length,desc:'You opened a demo position'},
+    {id:'open',lbl:'Open',cnt:acceptedOpen.length,desc:'Accepted and still running'},
+    {id:'closedTp',lbl:'Closed · TP',cnt:acceptedClosedTp.length,desc:'Closed by take-profit'},
+    {id:'closedSl',lbl:'Closed · SL',cnt:acceptedClosedSl.length,desc:'Closed by stop-loss'},
+    {id:'closedManual',lbl:'Closed · Manual',cnt:acceptedClosedManual.length,desc:'You closed these yourself'},
     {id:'watching',lbl:'Watching',cnt:watching.length,desc:'Monitoring outcome without a position'},
     {id:'rejected',lbl:'Rejected',cnt:rejected.length,desc:'You declined these signals'},
   ];
-  const list={pending,accepted,watching,rejected}[tab]||[];
+  const list={pending,open:acceptedOpen,closedTp:acceptedClosedTp,closedSl:acceptedClosedSl,closedManual:acceptedClosedManual,watching,rejected}[tab]||[];
 
   const SigCard=({sig,livePrice})=>e('div',{className:'sig-card sig-'+sig.dir.toLowerCase()},
     e('div',{className:'sig-accent'}),
@@ -1483,7 +1505,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
           ))
         ),
         e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:6,paddingLeft:2}},
-          {pending:'Signals waiting for your decision — accept, watch, or reject each one.',accepted:'Signals you accepted. A demo position was opened for each one. Close them in Portfolio.',watching:'Signals you chose to monitor without opening a position. Useful for tracking AI accuracy.',rejected:'Signals you declined. All rejections are saved to your trade journal for review.'}[tab]
+          {pending:'Signals waiting for your decision — accept, watch, or reject each one.',open:'Accepted signals with a paper position still running. Manage them in Portfolio.',closedTp:'Accepted signals that hit their take-profit target.',closedSl:'Accepted signals that hit their stop-loss.',closedManual:'Accepted signals you closed yourself before TP or SL was hit.',watching:'Signals you chose to monitor without opening a position. Useful for tracking AI accuracy.',rejected:'Signals you declined. All rejections are saved to your trade journal for review.'}[tab]
         )
       ),
       tab==='pending'&&pending.filter(s=>s.tradable!==false).length>1&&e('div',{style:{padding:'0 12px 10px'}},
@@ -1492,10 +1514,13 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
       list.length===0
         ?e('div',{className:'empty'},
             e('div',{className:'empty-icon'},'📡'),
-            e('div',{className:'empty-title'},'No '+tab+' signals'),
+            e('div',{className:'empty-title'},'No '+({pending:'pending',open:'open',closedTp:'TP-closed',closedSl:'SL-closed',closedManual:'manually closed',watching:'watching',rejected:'rejected'}[tab]||tab)+' signals'),
             e('div',{className:'empty-sub'},{
               pending:'A background scan checks BTC, ETH, XRP and LTC (vs ZAR) on four timeframes (M15, M30, H1, H4) every 5 minutes, running six strategies: Combined, Trend Rider, Momentum, Mean Reversion, Breakout and Pullback. New signals appear here when one of them lines up — tap ⟳ Refresh above to check now.',
-              accepted:'No accepted signals yet. Go to Pending to review available signals.',
+              open:'No open accepted signals yet. Go to Pending to review available signals.',
+              closedTp:'No signals have closed on take-profit yet.',
+              closedSl:'No signals have closed on stop-loss yet.',
+              closedManual:'No signals have been closed manually yet.',
               watching:'No signals on watchlist yet. Tap "Watch Only" on a pending signal to track its outcome without risk.',
               rejected:'No rejected signals. When you reject a signal you can add a reason — useful for journaling patterns.'
             }[tab])
@@ -1641,7 +1666,7 @@ function EvolutionLab({showToast}){
           e('span',null,'🧬'),
           e('div',null,
             e('div',{style:{fontWeight:700,marginBottom:2}},'What is a Strategy?'),
-            'These are the actual genomes your evolution engine is running server-side, on their own R10,000 sandbox account, against live BTC, ETH, XRP and LTC (vs ZAR) 15-minute data — separate from your R1,000 demo account. A genome needs '+EVO_MIN_TRADES+' closed trades before it can be retired or bred.'
+            'These are the actual genomes your evolution engine is running server-side, on their own R10,000 sandbox account, against live BTC, ETH, XRP and LTC (vs ZAR) 15-minute data — separate from your R10,000 demo account. A genome needs '+EVO_MIN_TRADES+' closed trades before it can be retired or bred.'
           )
         ),
 
@@ -1827,7 +1852,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
   const[srLoading,setSrLoading]=useState(false);
   const[srBusy,setSrBusy]=useState(null);
   const equity=liveEquity!=null?liveEquity:account.balance;
-  const totalReturn=((account.balance-1000)/1000*100);
+  const totalReturn=((account.balance-zsStartBal(account))/zsStartBal(account)*100);
   const equityData=zsEquityCurve(account,equity);
 
   const loadStrategyReview=useCallback(async()=>{
@@ -2009,7 +2034,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
     e('div',{className:'hdr'},
       e('div',null,
         e('div',{style:{fontSize:16,fontWeight:800}},'Demo Portfolio'),
-        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,marginTop:1}},'YOUR SIMULATED R1,000 ACCOUNT')
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5,marginTop:1}},'YOUR SIMULATED R10,000 ACCOUNT')
       ),
       e('span',{className:'mode-badge badge-demo'},'SIMULATED')
     ),
@@ -2018,23 +2043,23 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
         e('span',null,'💼'),
         e('div',null,
           e('div',{style:{fontWeight:700,marginBottom:2}},'What is the Demo Portfolio?'),
-          'This is your simulated trading account. It starts with R1,000 of virtual money. When you accept a signal, a demo position opens here. When the trade closes (either at Take Profit, Stop Loss, or manually), your balance updates. Nothing here is real money — it is a safe environment to test your decision-making.'
+          'This is your simulated trading account. It starts with R10,000 of virtual money. When you accept a signal, a demo position opens here. When the trade closes (either at Take Profit, Stop Loss, or manually), your balance updates. Nothing here is real money — it is a safe environment to test your decision-making.'
         )
       ),
 
       // Balance summary
       e('div',{className:'stat-grid',style:{paddingTop:4}},
         e('div',{className:'stat-box'},
-          e('div',{className:'stat-lbl'},e(HelpLabel,{label:'Balance',help:'Your current demo account balance. This changes every time a trade closes. It started at R1,000 and every win increases it, every loss decreases it.'})),
+          e('div',{className:'stat-lbl'},e(HelpLabel,{label:'Balance',help:'Your current demo account balance. This changes every time a trade closes. It started at R10,000 and every win increases it, every loss decreases it.'})),
           e('div',{className:'stat-val stat-neu'},fmtCur(account.balance)),
-          e('div',{className:'stat-sub'},'Started at R1,000.00')
+          e('div',{className:'stat-sub'},'Started at R10,000.00')
         ),
         e('div',{className:'stat-box'},
           e('div',{className:'stat-lbl'},e(HelpLabel,{label:"Today's P/L",help:'The total profit or loss from all trades that closed today. This resets every day at midnight. Tracked against your daily loss limit in the Risk Vault.'})),
           e('div',{className:'stat-val '+(account.dailyPL>=0?'stat-up':'stat-dn')},
             (account.dailyPL>=0?'+':'')+fmtCur(account.dailyPL)
           ),
-          e('div',{className:'stat-sub'},fmtPct((account.dailyPL/(account.balance||1000))*100)+' of balance')
+          e('div',{className:'stat-sub'},fmtPct((account.dailyPL/(account.balance||zsStartBal(account)))*100)+' of balance')
         ),
         e('div',{className:'stat-box'},
           e('div',{className:'stat-lbl'},e(HelpLabel,{label:'Open Positions',help:'How many demo trades are currently open. Each one has capital tied up as margin. To free up capacity for new signals, you can manually close a position using the Close button.'})),
@@ -2042,11 +2067,11 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
           e('div',{className:'stat-sub',style:{color:'var(--amber)'}},fmtCur(account.used)+' reserved')
         ),
         e('div',{className:'stat-box'},
-          e('div',{className:'stat-lbl'},e(HelpLabel,{label:'Total Return',help:'How much your R1,000 account has grown or shrunk since you started. A positive percentage means your demo trading has been profitable overall.'})),
+          e('div',{className:'stat-lbl'},e(HelpLabel,{label:'Total Return',help:'How much your R10,000 account has grown or shrunk since you started. A positive percentage means your demo trading has been profitable overall.'})),
           e('div',{className:'stat-val '+(totalReturn>=0?'stat-up':'stat-dn')},
             (totalReturn>=0?'+':'')+totalReturn.toFixed(2)+'%'
           ),
-          e('div',{className:'stat-sub'},'From R1,000 start')
+          e('div',{className:'stat-sub'},'From R10,000 start')
         )
       ),
 
@@ -2197,7 +2222,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
             {l:'Win Rate',v:account.closedTrades.length>0?winRate+'%':'—',c:winRate>=50?'var(--green)':'var(--red)',d:'Percentage of trades that were profitable. 50%+ is positive, but profitability also depends on the size of wins vs losses (profit factor).'},
             {l:'Best Winning Trade',v:wins.length>0?'+'+fmtCur(Math.max(...wins.map(t=>t.pl))):'—',c:'var(--green)',d:'Your single biggest profitable trade'},
             {l:'Worst Losing Trade',v:losses.length>0?fmtCur(Math.min(...losses.map(t=>t.pl))):'—',c:'var(--red)',d:'Your single biggest loss'},
-            {l:'Total P/L',v:(account.balance-1000>=0?'+':'')+fmtCur(account.balance-1000),c:account.balance>=1000?'var(--green)':'var(--red)',d:'Total profit or loss from your starting R1,000 balance'},
+            {l:'Total P/L',v:(account.balance-zsStartBal(account)>=0?'+':'')+fmtCur(account.balance-zsStartBal(account)),c:account.balance>=zsStartBal(account)?'var(--green)':'var(--red)',d:'Total profit or loss from your starting R10,000 balance'},
           ].map(({l,v,c,d})=>e('div',{key:l,style:{borderBottom:'1px solid var(--border)',paddingBottom:8,marginBottom:8}},
             e('div',{className:'row'},
               e('div',{style:{fontSize:13,fontWeight:600}},l),
@@ -2218,7 +2243,7 @@ function MoreMenu({setSubScreen}){
     {id:'forward',icon:'🧪',label:'Forward Testing',sub:'Validate strategies on fresh market data after backtesting. The final approval gate before a strategy goes live on your demo account.',badge:''},
     {id:'risk',icon:'🛡️',label:'Risk Vault',sub:'Set your personal risk rules — maximum loss per trade, daily loss limits, circuit breakers, and the emergency kill switch.',badge:''},
     {id:'readiness',icon:'🚀',label:'Live Readiness',sub:'Per-strategy checklist for real money: trade count vs the 50/15 threshold, drawdown, and P/L after fees and slippage.',badge:''},
-    {id:'broker',icon:'🔌',label:'Broker Connection',sub:'Future integration: connect your own broker API so approved signals can be executed in your live account with one tap.',badge:'COMING SOON'},
+    {id:'broker',icon:'🔌',label:'Broker Connection',sub:'Connect your Luno API key so approved signals can be executed in your live account with one tap.',badge:''},
     {id:'settings',icon:'⚙️',label:'Settings',sub:'App preferences, account management, data reset, and version information.',badge:''},
   ];
   return e('div',{className:'screen'},
@@ -2777,7 +2802,7 @@ function RiskVault({riskSettings,setRiskSettings,account,showToast}){
       e('div',{className:'settings-section'},
         e('div',{className:'settings-hdr'},'Per-Trade Risk Rules'),
         e(RuleRow,{label:'Risk Per Trade (%)',
-          desc:'The maximum percentage of your balance to risk on any single trade. R1,000 × 1% = R100 maximum risk per trade. Recommended: 1–2%. Never exceed 5% per trade.',
+          desc:'The maximum percentage of your balance to risk on any single trade. R10,000 × 1% = R100 maximum risk per trade. Recommended: 1–2%. Never exceed 5% per trade.',
           inputEl:e(NumInput,{k:'riskPerTrade',min:.1,max:5,step:.1})}),
         e(RuleRow,{label:'Maximum Open Trades at Once',
           desc:'Caps how many positions you can have open simultaneously. This prevents over-exposure. If you have 5 positions and this is set to 5, no new signals can be accepted until one closes.',
@@ -2794,7 +2819,7 @@ function RiskVault({riskSettings,setRiskSettings,account,showToast}){
       e('div',{className:'settings-section'},
         e('div',{className:'settings-hdr'},'Loss Limit Circuit Breakers'),
         e(RuleRow,{label:'Maximum Daily Loss (%)',
-          desc:'If your account loses this percentage in a single day, all new trading is blocked until the next day. Example: 3% of R1,000 = R300 maximum daily loss before the circuit breaker trips.',
+          desc:'If your account loses this percentage in a single day, all new trading is blocked until the next day. Example: 3% of R10,000 = R300 maximum daily loss before the circuit breaker trips.',
           inputEl:e(NumInput,{k:'maxDailyLoss',min:.5,max:20,step:.5})}),
         e(RuleRow,{label:'Maximum Weekly Loss (%)',
           desc:'If your account loses this percentage in a week, trading is blocked until the following Monday. Protects you from catastrophic drawdown during a bad week.',
@@ -2903,7 +2928,7 @@ function LiveReadiness({showToast}){
         e('span',null,'🚀'),
         e('div',null,
           e('div',{style:{fontWeight:700,marginBottom:2}},'What this checks'),
-          'For each strategy: whether it has 50 trades actually closed by TP or SL (manual closes never count here — see Manual Closes below), its net P/L after the same exchange fees and stop-loss slippage a real Luno order would face, and its worst peak-to-trough drawdown. Nothing on this screen turns live trading on — that switch does not exist yet.'
+          'For each strategy: whether it has 50 trades actually closed by TP or SL (manual closes never count here — see Manual Closes below), its net P/L after the same exchange fees and stop-loss slippage a real Luno order would face, and its worst peak-to-trough drawdown. Nothing on this screen turns live trading on — that switch lives in Broker Connection.'
         )
       ),
 
@@ -2911,7 +2936,7 @@ function LiveReadiness({showToast}){
         e('div',{className:'warn-icon'},liveOn?'🟢':'⛔'),
         e('div',{className:'warn-text'},
           e('div',{style:{fontWeight:700,marginBottom:3,color:liveOn?'var(--green)':'var(--red)'}},liveOn?'Live Trading Flag: ON':'Live Trading Flag: OFF'),
-          'Broker Connection is still Coming Soon, so no order path exists yet either way — this flag and a connected broker would both be required before a single real trade could be placed.'
+          'Broker Connection is live under More — this flag and a saved, verified Luno trading key are both required before a single real trade could be placed.'
         )
       ),
 
@@ -3390,7 +3415,7 @@ function ParserKeySettings({showToast}){
   );
 }
 
-function AppSettings({showToast,onLogout,account,setAccount}){
+function AppSettings({showToast,onLogout,account,setAccount,signals,setSignals}){
   const[notifs,setNotifs]=useState(false);
   const[sigAlerts,setSigAlerts]=useState(true);
   const[riskAlerts,setRiskAlerts]=useState(true);
@@ -3398,6 +3423,50 @@ function AppSettings({showToast,onLogout,account,setAccount}){
   const[newSigAlerts,setNewSigAlerts]=useState(true);
   const[pushBusy,setPushBusy]=useState(false);
   const[resetConfirm,setResetConfirm]=useState(false);
+  const[sysFlags,setSysFlags]=useState(null);
+  const liveModeOn=!!(sysFlags&&sysFlags.live_trading_enabled);
+  const[clearBusy,setClearBusy]=useState(null);
+  const[clearConfirm,setClearConfirm]=useState(null);
+
+  // Mirrors the same Open/Closed-TP/Closed-SL/Closed-Manual split used on the
+  // Signal Desk, so each "Clear" button here removes exactly what that
+  // sub-tab shows — nothing more.
+  const sigList=signals||[];
+  const openSigIds2=useMemo(()=>new Set((account.openPositions||[]).filter(p=>p.sigId).map(p=>p.sigId)),[account.openPositions]);
+  const closedSigBucket2=useMemo(()=>{
+    const m={};
+    (account.closedTrades||[]).forEach(t=>{ if(t.sigId&&!(t.sigId in m))m[t.sigId]=zsExitBucket(t); });
+    return m;
+  },[account.closedTrades]);
+  const sigBuckets={
+    pending:sigList.filter(s=>s.status==='Pending'),
+    open:sigList.filter(s=>s.status==='Accepted'&&(openSigIds2.has(s.id)||!(s.id in closedSigBucket2))),
+    closedTp:sigList.filter(s=>s.status==='Accepted'&&closedSigBucket2[s.id]==='tp'),
+    closedSl:sigList.filter(s=>s.status==='Accepted'&&closedSigBucket2[s.id]==='sl'),
+    closedManual:sigList.filter(s=>s.status==='Accepted'&&closedSigBucket2[s.id]==='manual'),
+    watching:sigList.filter(s=>s.status==='Watching'),
+    rejected:sigList.filter(s=>s.status==='Rejected'),
+  };
+  const clearLabels={pending:'Pending',open:'Open',closedTp:'Closed · TP',closedSl:'Closed · SL',closedManual:'Closed · Manual',watching:'Watching',rejected:'Rejected'};
+
+  async function clearSignalBucket(key){
+    const items=key==='all'?sigList:sigBuckets[key];
+    if(!items.length){showToast('Nothing to clear here','info');return;}
+    if(clearConfirm!==key){setClearConfirm(key);return;}
+    setClearConfirm(null);
+    setClearBusy(key);
+    try{
+      const ids=items.map(s=>s.id).filter(Boolean);
+      if(window.ZuShePaperDB?.deleteSignals)await window.ZuShePaperDB.deleteSignals(ids);
+      const idSet=new Set(ids);
+      setSignals&&setSignals(ss=>ss.filter(s=>!idSet.has(s.id)));
+      showToast('Cleared '+items.length+' signal'+(items.length===1?'':'s'),'success');
+    }catch(err){
+      showToast('Could not clear: '+(err?.message||err),'error');
+    }finally{
+      setClearBusy(null);
+    }
+  }
 
   // Clears the local Dashboard "paper engine" (localStorage-based, separate
   // from the Supabase-backed Signal Desk) — mainly for wiping out the
@@ -3418,6 +3487,7 @@ function AppSettings({showToast,onLogout,account,setAccount}){
       for(let i=0;i<20&&!window.ZuShePaperDB;i++){ await new Promise(r=>setTimeout(r,150)); }
       if(cancelled||!window.ZuShePaperDB)return;
       try{
+        window.ZuShePaperDB.getSystemFlags().then(fl=>{if(!cancelled)setSysFlags(fl);}).catch(()=>{});
         const sub=await window.ZuShePaperDB.getPushSubscription();
         if(cancelled)return;
         if(sub && typeof Notification!=='undefined' && Notification.permission==='granted'){
@@ -3502,9 +3572,9 @@ function AppSettings({showToast,onLogout,account,setAccount}){
         e('div',{className:'settings-row'},
           e('div',null,
             e('div',{className:'settings-lbl'},'Trading Mode'),
-            e('div',{className:'settings-sub'},'Demo simulation using your virtual R1,000 account. Switch to live requires broker connection.')
+            e('div',{className:'settings-sub'},liveModeOn?'Live trading is enabled — approved signals can be executed on your real Luno account.':'Demo simulation using your virtual R10,000 account. Switches to live automatically once you enable live trading in Broker Connection.')
           ),
-          e('span',{className:'pill pill-watch'},'DEMO')
+          e('span',{className:liveModeOn?'pill pill-buy':'pill pill-watch'},liveModeOn?'LIVE':'DEMO')
         ),
         e('div',{className:'settings-row'},
           e('div',null,
@@ -3518,7 +3588,7 @@ function AppSettings({showToast,onLogout,account,setAccount}){
             e('div',{className:'settings-lbl'},'Starting Demo Balance'),
             e('div',{className:'settings-sub'},'All demo trading starts from this baseline amount')
           ),
-          e('span',{style:{fontFamily:'var(--mono)',fontWeight:700,color:'var(--cyan)',fontSize:13}},'R1,000')
+          e('span',{style:{fontFamily:'var(--mono)',fontWeight:700,color:'var(--cyan)',fontSize:13}},'R10,000')
         )
       ),
 
@@ -3571,7 +3641,7 @@ function AppSettings({showToast,onLogout,account,setAccount}){
             ),
             e('div',{style:{marginBottom:8}},
               e('span',{style:{fontWeight:700,color:'var(--cyan)'}},'Is this real trading?'),e('br',null),
-              'No. Everything in this app is PAPER SIMULATION ONLY. Live broker execution is locked in v1. The R1,000 balance is virtual. All signals are proposals only. No real money is involved.'
+              'No. Everything in this app is PAPER SIMULATION ONLY unless you enable live trading in Broker Connection. The demo balance is virtual. No real money is involved unless live trading is switched on.'
             ),
             e('div',{style:{marginBottom:8}},
               e('span',{style:{fontWeight:700,color:'var(--cyan)'}},'Does it guarantee profits?'),e('br',null),
@@ -3591,24 +3661,31 @@ function AppSettings({showToast,onLogout,account,setAccount}){
         e('div',{className:'settings-row',style:{cursor:'pointer'},
           onClick:()=>{
             LS.del('za_account');
-            showToast('Demo account reset to R1,000 — reload to see changes','info');
+            showToast('Demo account reset to R10,000 — reload to see changes','info');
           }},
           e('div',null,
-            e('div',{className:'settings-lbl',style:{color:'var(--amber)'}},'Reset Demo Account to R1,000'),
-            e('div',{className:'settings-sub'},'Clears all open positions, closed trades, and resets balance to the starting R1,000. Your strategies and signals are kept.')
+            e('div',{className:'settings-lbl',style:{color:'var(--amber)'}},'Reset Demo Account to R10,000'),
+            e('div',{className:'settings-sub'},'Clears all open positions, closed trades, and resets balance to the starting R10,000. Your strategies and signals are kept.')
           ),
           e('span',{style:{color:'var(--amber)',fontSize:18}},'›')
         ),
-        e('div',{className:'settings-row',style:{cursor:'pointer'},
-          onClick:()=>{
-            LS.del('za_signals');
-            showToast('Signal history cleared','info');
-          }},
+        e('div',{style:{padding:'10px 16px 2px',fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5}},'CLEAR SIGNAL HISTORY BY STATUS'),
+        e('div',{style:{padding:'0 16px 8px',fontSize:11,color:'var(--text3)',lineHeight:1.5}},'Clears the signals shown in that sub-tab of Signal Desk only. Trades and account balance are never touched. Tap once to confirm, tap again to clear.'),
+        Object.keys(clearLabels).map(key=>
+          e('div',{key:'clr-'+key,className:'settings-row',style:{cursor:'pointer'},onClick:()=>clearSignalBucket(key)},
+            e('div',null,
+              e('div',{className:'settings-lbl',style:{color:clearConfirm===key?'var(--red)':'var(--text)'}},clearLabels[key]+' ('+sigBuckets[key].length+')'),
+              e('div',{className:'settings-sub'},clearConfirm===key?'Tap again to confirm — this cannot be undone.':'Tap to clear this sub-tab\u2019s signal history.')
+            ),
+            e('span',{style:{color:'var(--amber)',fontSize:11,fontFamily:'var(--mono)'}},clearBusy===key?'Clearing…':'Clear ›')
+          )
+        ),
+        e('div',{className:'settings-row',style:{cursor:'pointer'},onClick:()=>clearSignalBucket('all')},
           e('div',null,
-            e('div',{className:'settings-lbl',style:{color:'var(--amber)'}},'Clear Signal History'),
-            e('div',{className:'settings-sub'},'Removes all accepted, rejected, and watched signals. Pending signals return to their original state.')
+            e('div',{className:'settings-lbl',style:{color:clearConfirm==='all'?'var(--red)':'var(--amber)'}},'Clear ALL Signal History ('+sigList.length+')'),
+            e('div',{className:'settings-sub'},clearConfirm==='all'?'Tap again to confirm — this cannot be undone.':'Clears every sub-tab above at once. Trades and account balance are never touched.')
           ),
-          e('span',{style:{color:'var(--amber)',fontSize:18}},'›')
+          e('span',{style:{color:'var(--red)',fontSize:18}},'›')
         ),
         e('div',{className:'settings-row',style:{cursor:'pointer'},
           onClick:()=>{
@@ -3721,7 +3798,7 @@ function App(){
     const db=window.ZuShePaperDB; if(!db?.ensureAccount)return;
     try{
       let remote=await db.ensureAccount(); if(!remote)return;
-      const LIMIT=500;
+      const LIMIT=10000;
       const rows=await db.loadTrades(LIMIT);
       const complete=rows.length<LIMIT;
       const tz=d=>new Date(d).toLocaleDateString('en-CA',{timeZone:'Africa/Johannesburg'});
@@ -3731,7 +3808,7 @@ function App(){
       const closedRows=closedAll.filter(t=>!zsIsVoided(t));
       const voidedIds=new Set(closedAll.filter(zsIsVoided).map(t=>t.id));
       if(complete){
-        const start=Number(remote.starting_balance)||1000;
+        const start=Number(remote.starting_balance)||10000;
         const expected=parseFloat((start+closedAll.reduce((s,t)=>s+(Number(t.net_pnl)||0),0)).toFixed(2));
         if(Math.abs(expected-Number(remote.balance))>0.05){
           try{const fixed=await db.recomputeAccount(); if(fixed)remote=fixed;}catch(_e){}
@@ -3762,6 +3839,7 @@ function App(){
         const localClosedKept=(a.closedTrades||[]).filter(t=>t.status!=='Void'&&!(t.dbId&&(serverClosedIds.has(t.dbId)||voidedIds.has(t.dbId)))&&!(t.paper&&Math.abs(Number(t.pl)||0)>50000));
         const closedTrades=[...closedRows.map(zsRowToClosed),...localClosedKept].sort((x,y)=>new Date(y.closeTime||0)-new Date(x.closeTime||0));
         return {...a,balance,equity:balance,dailyPL:daily,openPositions,closedTrades,
+          starting_balance:Number(remote.starting_balance)||zsStartBal(a),
           used:parseFloat(openPositions.reduce((s,p)=>s+(Number(p.risk)||0),0).toFixed(2))};
       });
     }catch(err){ console.warn('[ZuShé Trader] Could not sync Supabase paper account:',err?.message||err); }
@@ -3825,7 +3903,7 @@ function App(){
     risk:e(RiskVault,{riskSettings,setRiskSettings,account,showToast}),
     readiness:e(LiveReadiness,{showToast}),
     broker:e(BrokerConnection,{showToast}),
-    settings:e(AppSettings,{showToast,onLogout:logout,account,setAccount}),
+    settings:e(AppSettings,{showToast,onLogout:logout,account,setAccount,signals,setSignals}),
   };
 
   const SCREENS={
@@ -3919,9 +3997,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
         owner_key: ZS_OWNER_KEY,
         name: 'Primary Paper Account',
         currency: 'ZAR',
-        starting_balance: 1000,
-        balance: 1000,
-        equity: 1000
+        starting_balance: 10000,
+        balance: 10000,
+        equity: 10000
       })
       .select()
       .single();
@@ -3939,7 +4017,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       paper_mode: true,
       pair: ZS_PAIR,
       timeframe: ZS_TIMEFRAME,
-      starting_balance: 1000,
+      starting_balance: 10000,
       risk_per_trade: 0.01,
       max_daily_loss: 0.15,
       max_open_trades: 40,
@@ -4229,7 +4307,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       const p = Number(t.net_pnl) || 0; sum += p;
       if (t.exit_time && tz(t.exit_time) === today) daily += p;
     });
-    const balance = parseFloat(((Number(account.starting_balance) || 1000) + sum).toFixed(2));
+    const balance = parseFloat(((Number(account.starting_balance) || 10000) + sum).toFixed(2));
     return zsPersistAccount({ balance, equity: balance, realized_pnl: parseFloat(sum.toFixed(2)), daily_pnl: parseFloat(daily.toFixed(2)) });
   }
 
@@ -4246,7 +4324,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       .eq('account_id', account?.id || null)
       .neq('direction', 'NO TRADE')
       .order('created_at', { ascending: false })
-      .limit(100);
+      .limit(10000);
     if (error) { console.warn('[ZuShé Trader] loadSignals failed:', error.message || error); return []; }
     return data || [];
   }
@@ -4258,6 +4336,17 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     if (reason) payload.decision_reason = reason;
     const { error } = await db.from('trader_signals').update(payload).eq('id', id);
     if (error) console.warn('[ZuShé Trader] decideSignal failed:', error.message || error);
+  }
+
+  // Deletes a batch of signal rows by id — used by the Settings "clear
+  // history" controls (per sub-tab and clear-all). Never touches
+  // trader_paper_trades, so open/closed position history is unaffected.
+  async function zsDeleteSignals(ids) {
+    const db = zsInitSupabase();
+    if (!db || !ids || !ids.length) return { deleted: 0 };
+    const { error } = await db.from('trader_signals').delete().in('id', ids);
+    if (error) { console.warn('[ZuShé Trader] deleteSignals failed:', error.message || error); throw error; }
+    return { deleted: ids.length };
   }
 
   // Telegram screenshot -> signal. The edge function reads the image with
@@ -4447,6 +4536,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     closeTrade: zsCloseTrade,
     loadSignals: zsLoadSignals,
     decideSignal: zsDecideSignal,
+    deleteSignals: zsDeleteSignals,
     submitTelegramSignal: zsSubmitTelegramSignal,
     getSecretStatus: zsGetSecretStatus,
     saveSecret: zsSaveSecret,
