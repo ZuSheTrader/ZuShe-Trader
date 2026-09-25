@@ -1206,17 +1206,24 @@ function zsRoundTripFee(entryPrice,exitPrice,qty){return Number(((Number(entryPr
 // (last-entry)*size with no spread/fee taken off, so a real paper trade could show
 // "+R8.25 unrealized" and then close at a loss once the ~0.2% round-trip taker fee
 // (charged on notional, so it can dwarf a small gross move) and the manual-close
-// spread estimate were subtracted. Mirror the exact same math here.
-function zsUnrealizedPl(pos,lastPx){
+// spread estimate were subtracted. Mirror the exact same math here, and expose the
+// gross/fee/net breakdown too so the card can show its working, not just a number.
+function zsUnrealizedBreakdown(pos,lastPx){
   if(!lastPx||!pos.entry)return null;
   if(pos.paper){
     const spreadAdj=1+(ZS_FEE_MODEL.manualSpreadBps/10000)*(pos.dir==='BUY'?-1:1);
     const exitPrice=zsRoundPrice(lastPx*spreadAdj);
-    const grossPl=(pos.dir==='BUY'?(exitPrice-pos.entry):(pos.entry-exitPrice))*(pos.size||0);
+    const gross=parseFloat(((pos.dir==='BUY'?(exitPrice-pos.entry):(pos.entry-exitPrice))*(pos.size||0)).toFixed(2));
     const fee=zsRoundTripFee(pos.entry,exitPrice,pos.size||0);
-    return parseFloat((grossPl-fee).toFixed(2));
+    const net=parseFloat((gross-fee).toFixed(2));
+    return {gross,fee,net,exitPrice};
   }
-  return (pos.dir==='BUY'?(lastPx-pos.entry):(pos.entry-lastPx))*(pos.size||0);
+  const gross=parseFloat(((pos.dir==='BUY'?(lastPx-pos.entry):(pos.entry-lastPx))*(pos.size||0)).toFixed(2));
+  return {gross,fee:0,net:gross,exitPrice:lastPx};
+}
+function zsUnrealizedPl(pos,lastPx){
+  const b=zsUnrealizedBreakdown(pos,lastPx);
+  return b?b.net:null;
 }
 // Real equity curve from closed trades (oldest first), ending at live equity.
 function zsEquityCurve(account,equity){
@@ -2125,7 +2132,8 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
             )
           :account.openPositions.map(pos=>{
               const lastPx=livePrices&&livePrices[pos.pair];
-              const uPl=zsUnrealizedPl(pos,lastPx);
+              const uBreak=zsUnrealizedBreakdown(pos,lastPx);
+              const uPl=uBreak?uBreak.net:null;
               return e('div',{key:pos.id,className:'card'},
               e('div',{className:'row',style:{marginBottom:10}},
                 e('div',null,
@@ -2139,6 +2147,20 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
                   e('div',{style:{fontSize:10,color:'var(--text3)'}},'At risk'),
                   e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:14,color:'var(--amber)'}},fmtCur(pos.risk)),
                   uPl!=null&&e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:uPl>=0?'var(--green)':'var(--red)',marginTop:2}},(uPl>=0?'+':'')+fmtCur(uPl)+' unrealized')
+                )
+              ),
+              pos.paper&&uBreak&&e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,textAlign:'center',background:'var(--glass)',borderRadius:8,padding:'8px 10px',marginBottom:10}},
+                e('div',null,
+                  e('div',{style:{fontSize:9,color:'var(--text3)',marginBottom:2}},'GROSS'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:uBreak.gross>=0?'var(--green)':'var(--red)'}},(uBreak.gross>=0?'+':'')+fmtCur(uBreak.gross))
+                ),
+                e('div',{style:{borderLeft:'1px solid var(--border)',borderRight:'1px solid var(--border)'}},
+                  e('div',{style:{fontSize:9,color:'var(--text3)',marginBottom:2}},'ROUND-TRIP FEE'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:'var(--amber)'}},'-'+fmtCur(uBreak.fee))
+                ),
+                e('div',null,
+                  e('div',{style:{fontSize:9,color:'var(--text3)',marginBottom:2}},'NET (unrealized)'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:uBreak.net>=0?'var(--green)':'var(--red)'}},(uBreak.net>=0?'+':'')+fmtCur(uBreak.net))
                 )
               ),
               e('div',{style:{background:'var(--glass)',borderRadius:8,padding:'10px',marginBottom:10}},
