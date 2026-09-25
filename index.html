@@ -563,7 +563,7 @@ function paperRiskAllowed(stats,account){
   if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
   return {ok:true};
 }
-const ZS_BUILD='2026-09-24.6';
+const ZS_BUILD='2026-09-25.1';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,20000):1000;}
 function paperPositionSize(balance,entry,stop){
@@ -2842,13 +2842,15 @@ function RiskVault({riskSettings,setRiskSettings,account,showToast}){
 // peak-to-trough run (max_drawdown) — the three things worth checking before
 // sizing a strategy up with real money, none of which is a live-trading
 // switch by itself.
-const ZS_READY_MIN_TRADES=50,ZS_READY_MIN_AUTO=15;
+const ZS_READY_MIN_TRADES=50;
+// Readiness is judged on AUTO (TP/SL) closes only — manual closes never count
+// toward this gate. See the Manual Closes section further down for those.
 function zsReadinessOf(sr){
-  const n=sr.closed_trades||0,auto=sr.auto_trades||0;
-  const netPnl=Number(sr.net_pnl)||0;
-  if(n<ZS_READY_MIN_TRADES||auto<ZS_READY_MIN_AUTO)return{tier:'data',lbl:'Not enough data yet',cls:'pill-purple'};
+  const auto=sr.auto_trades||0;
+  const netPnl=Number(sr.net_pnl)||0; // auto-only net (server computes it that way now)
+  if(auto<ZS_READY_MIN_TRADES)return{tier:'data',lbl:'Not enough data yet',cls:'pill-purple'};
   if(sr.verdict==='underperforming')return{tier:'no',lbl:'Losing after fees',cls:'pill-sell'};
-  if(sr.verdict==='manual_only')return{tier:'caution',lbl:'Only profitable via manual exits',cls:'pill-watch'};
+  if(sr.verdict==='manual_only')return{tier:'caution',lbl:'Loses on auto — manual saves it',cls:'pill-watch'};
   if(netPnl>0)return{tier:'ready',lbl:'Worth considering',cls:'pill-cyan'};
   return{tier:'caution',lbl:'Breaking even',cls:'pill-watch'};
 }
@@ -2884,7 +2886,7 @@ function LiveReadiness({showToast}){
     return()=>{cancelled=true;clearInterval(iv);};
   },[load]);
 
-  const withData=rows.filter(sr=>(sr.closed_trades||0)>0);
+  const withData=rows.filter(sr=>(sr.auto_trades||0)>0||(sr.manual_trades||0)>0);
   const readyCount=withData.filter(sr=>zsReadinessOf(sr).tier==='ready').length;
   const liveOn=!!(flags&&flags.live_trading_enabled);
 
@@ -2901,7 +2903,7 @@ function LiveReadiness({showToast}){
         e('span',null,'🚀'),
         e('div',null,
           e('div',{style:{fontWeight:700,marginBottom:2}},'What this checks'),
-          'For each strategy: whether it has the 50 closed trades (15+ by actual TP/SL) the scorekeeper needs to judge it, its net P/L after the same exchange fees and stop-loss slippage a real Luno order would face, and its worst peak-to-trough drawdown. Nothing on this screen turns live trading on — that switch does not exist yet.'
+          'For each strategy: whether it has 50 trades actually closed by TP or SL (manual closes never count here — see Manual Closes below), its net P/L after the same exchange fees and stop-loss slippage a real Luno order would face, and its worst peak-to-trough drawdown. Nothing on this screen turns live trading on — that switch does not exist yet.'
         )
       ),
 
@@ -2933,11 +2935,11 @@ function LiveReadiness({showToast}){
           )
         :withData.map(sr=>{
             const r=zsReadinessOf(sr);
-            const n=sr.closed_trades||0,auto=sr.auto_trades||0;
-            const tradesLeft=Math.max(0,ZS_READY_MIN_TRADES-n);
-            const autoLeft=Math.max(0,ZS_READY_MIN_AUTO-auto);
+            const auto=sr.auto_trades||0;
+            const tradesLeft=Math.max(0,ZS_READY_MIN_TRADES-auto);
             const netPnl=Number(sr.net_pnl)||0;
             const dd=Number(sr.max_drawdown)||0;
+            const manualN=sr.manual_trades||0;
             return e('div',{key:sr.strategy,className:'card'},
               e('div',{className:'row',style:{marginBottom:6}},
                 e('div',{style:{display:'flex',alignItems:'center',gap:8}},
@@ -2946,17 +2948,17 @@ function LiveReadiness({showToast}){
                 ),
                 e('span',{style:{fontFamily:'var(--mono)',fontSize:12,fontWeight:700,color:netPnl>=0?'var(--green)':'var(--red)'}},(netPnl>=0?'+':'')+fmtCur(netPnl))
               ),
-              e('div',{style:{fontSize:10,color:'var(--text3)',marginBottom:8}},'Net P/L after fees + slippage'),
+              e('div',{style:{fontSize:10,color:'var(--text3)',marginBottom:8}},'Auto (TP/SL) net P/L after fees + slippage — manual closes excluded'),
               e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,background:'var(--glass)',borderRadius:8,padding:'10px',marginBottom:8,textAlign:'center'}},
                 e('div',null,
-                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'CLOSED'),
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:13,color:tradesLeft===0?'var(--green)':'var(--text)'}},n+'/'+ZS_READY_MIN_TRADES),
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'AUTO (TP/SL)'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:13,color:tradesLeft===0?'var(--green)':'var(--text)'}},auto+'/'+ZS_READY_MIN_TRADES),
                   e('div',{style:{fontSize:9,color:'var(--text3)'}},tradesLeft===0?'Met':tradesLeft+' to go')
                 ),
                 e('div',{style:{borderLeft:'1px solid var(--border)',borderRight:'1px solid var(--border)'}},
-                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'AUTO (TP/SL)'),
-                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:13,color:autoLeft===0?'var(--green)':'var(--text)'}},auto+'/'+ZS_READY_MIN_AUTO),
-                  e('div',{style:{fontSize:9,color:'var(--text3)'}},autoLeft===0?'Met':autoLeft+' to go')
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'MANUAL'),
+                  e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:13}},manualN),
+                  e('div',{style:{fontSize:9,color:'var(--text3)'}},'not counted here')
                 ),
                 e('div',null,
                   e('div',{style:{fontSize:9,color:'var(--text3)'}},'MAX DRAWDOWN'),
@@ -2969,7 +2971,25 @@ function LiveReadiness({showToast}){
                 (sr.profit_factor!=null?'profit factor '+Number(sr.profit_factor).toFixed(2):'profit factor n/a')
               )
             );
-          })
+          }),
+
+      // Manual closes — kept fully separate from the readiness verdicts above.
+      // These say more about your own timing than the strategy's own TP/SL,
+      // so they never feed the 50-trade gate or the pass/fail verdict.
+      withData.some(sr=>(sr.manual_trades||0)>0)&&e('div',null,
+        e('div',{style:{padding:'18px 4px 8px',fontFamily:'var(--mono)',fontSize:9,color:'var(--purple)',letterSpacing:2}},'MANUAL CLOSES · INFORMATIONAL ONLY'),
+        e('div',{style:{padding:'0 4px 10px',fontSize:11,color:'var(--text3)',lineHeight:1.5}},'Trades you closed by hand on each strategy — shown separately because they reflect your own timing, not the strategy\'s TP/SL logic.'),
+        withData.filter(sr=>(sr.manual_trades||0)>0).map(sr=>{
+          const mN=sr.manual_trades||0,mNet=Number(sr.manual_net_pnl)||0,mWr=sr.manual_win_rate;
+          return e('div',{key:'manual_'+sr.strategy,className:'card card-sm',style:{marginBottom:8}},
+            e('div',{className:'row'},
+              e('span',{style:{fontWeight:700,fontSize:13}},sr.strategy),
+              e('span',{style:{fontFamily:'var(--mono)',fontSize:12,fontWeight:700,color:mNet>=0?'var(--green)':'var(--red)'}},(mNet>=0?'+':'')+fmtCur(mNet))
+            ),
+            e('div',{style:{fontSize:11,color:'var(--text3)'}},mN+' manual close'+(mN===1?'':'s')+(mWr!=null?' · '+Math.round(mWr)+'% win rate':''))
+          );
+        })
+      )
     )
   );
 }
