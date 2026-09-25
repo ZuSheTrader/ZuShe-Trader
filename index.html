@@ -1201,6 +1201,23 @@ function zsIsVoided(t){return String(t.exit_reason||'').startsWith('Voided');}
 const ZS_FEE_MODEL={takerFeeRate:0.001,manualSpreadBps:6};
 function zsRoundPrice(p){p=Number(p)||0;if(p<1)return Number(p.toFixed(6));if(p<100)return Number(p.toFixed(4));return Number(p.toFixed(2));}
 function zsRoundTripFee(entryPrice,exitPrice,qty){return Number(((Number(entryPrice)*qty+Number(exitPrice)*qty)*ZS_FEE_MODEL.takerFeeRate).toFixed(2));}
+// The "unrealized" figure shown on an open position must match what closePosition()
+// will actually book if you tap Close Now right now. It used to show raw
+// (last-entry)*size with no spread/fee taken off, so a real paper trade could show
+// "+R8.25 unrealized" and then close at a loss once the ~0.2% round-trip taker fee
+// (charged on notional, so it can dwarf a small gross move) and the manual-close
+// spread estimate were subtracted. Mirror the exact same math here.
+function zsUnrealizedPl(pos,lastPx){
+  if(!lastPx||!pos.entry)return null;
+  if(pos.paper){
+    const spreadAdj=1+(ZS_FEE_MODEL.manualSpreadBps/10000)*(pos.dir==='BUY'?-1:1);
+    const exitPrice=zsRoundPrice(lastPx*spreadAdj);
+    const grossPl=(pos.dir==='BUY'?(exitPrice-pos.entry):(pos.entry-exitPrice))*(pos.size||0);
+    const fee=zsRoundTripFee(pos.entry,exitPrice,pos.size||0);
+    return parseFloat((grossPl-fee).toFixed(2));
+  }
+  return (pos.dir==='BUY'?(lastPx-pos.entry):(pos.entry-lastPx))*(pos.size||0);
+}
 // Real equity curve from closed trades (oldest first), ending at live equity.
 function zsEquityCurve(account,equity){
   const closed=(account.closedTrades||[]).filter(t=>t.closeTime&&t.status!=='Void').slice().sort((a,b)=>new Date(a.closeTime)-new Date(b.closeTime));
@@ -2108,7 +2125,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
             )
           :account.openPositions.map(pos=>{
               const lastPx=livePrices&&livePrices[pos.pair];
-              const uPl=(lastPx&&pos.entry)?(pos.dir==='BUY'?(lastPx-pos.entry):(pos.entry-lastPx))*(pos.size||0):null;
+              const uPl=zsUnrealizedPl(pos,lastPx);
               return e('div',{key:pos.id,className:'card'},
               e('div',{className:'row',style:{marginBottom:10}},
                 e('div',null,
@@ -3776,10 +3793,8 @@ function App(){
 
   const unrealizedTotal=useMemo(()=>{
     return (account.openPositions||[]).reduce((sum,pos)=>{
-      const last=livePrices[pos.pair];
-      if(!last||!pos.entry)return sum;
-      const pl=(pos.dir==='BUY'?(last-pos.entry):(pos.entry-last))*(pos.size||0);
-      return sum+pl;
+      const pl=zsUnrealizedPl(pos,livePrices[pos.pair]);
+      return pl==null?sum:sum+pl;
     },0);
   },[account.openPositions,livePrices]);
   const liveEquity=parseFloat((account.balance+unrealizedTotal).toFixed(2));
