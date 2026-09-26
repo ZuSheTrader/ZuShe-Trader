@@ -651,7 +651,7 @@ function paperRiskAllowed(stats,account,riskSettings,candidate){
   }
   return {ok:true};
 }
-const ZS_BUILD='2026-09-25.2';
+const ZS_BUILD='2026-09-26.1';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
@@ -1868,12 +1868,13 @@ function EvolutionLab({showToast}){
                   e('div',{style:{background:fitColor+'18',color:fitColor,border:'1px solid '+fitColor+'40',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,fontFamily:'var(--mono)',flexShrink:0}},
                     g.trades_closed>=EVO_MIN_TRADES?('Fitness '+fit.toFixed(2)):(g.trades_closed+'/'+EVO_MIN_TRADES+' trades'))
                 ),
-                e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:6,marginBottom:10}},
+                e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr 1fr',gap:6,marginBottom:10}},
                   ...[
                     {l:'Win Rate',v:(g.win_rate||0)+'%',c:'var(--green)',tip:'Of the '+g.trades_closed+' real closed trades this genome has taken, '+(g.win_rate||0)+'% were profitable.'},
                     {l:'Avg R:R',v:(g.avg_rr||0).toFixed(2),c:'var(--cyan)',tip:'Average win size divided by average loss size, across this genome real closed trades.'},
                     {l:'Net P/L',v:fmtCur(g.net_pnl||0),c:(g.net_pnl||0)>=0?'var(--green)':'var(--red)',tip:'Total realized profit or loss from this genome real closed trades on the R10,000 evolution account.'},
                     {l:'Trades Closed',v:g.trades_closed||0,c:'var(--text2)',tip:'How many real trades this genome has actually completed. Needs 15 before it can be scored, retired, or bred from.'},
+                    {l:'Avg Conf',v:g.avg_confidence?g.avg_confidence+'%':'—',c:'var(--amber)',tip:'Average AI confidence this genome had when it opened its trades. The fitness score above already includes a small bonus/penalty if this genome high-confidence trades actually win more than its low-confidence ones ("calibration").'},
                   ].map(({l,v,c,tip})=>
                     e('div',{key:l,style:{background:'var(--glass)',borderRadius:8,padding:'6px 8px',textAlign:'center'}},
                       e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:c}},v),
