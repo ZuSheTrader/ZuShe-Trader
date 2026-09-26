@@ -555,30 +555,39 @@ function recordPaperTradeResult(pl){
   return updated;
 }
 
-function paperRiskAllowed(stats,account){
+function paperRiskAllowed(stats,account,riskSettings){
+  const rs=riskSettings||RISK_SETTINGS_SEED;
+  const numOr=(v,d)=>Number.isFinite(Number(v))?Number(v):d;
   const today=paperTzDate();
   const s=stats&&stats.date===today?stats:{dailyLoss:0,lossStreak:0};
-  if((account.openPositions||[]).filter(p=>p.paper).length>=PAPER_CONFIG.maxOpenTrades)return {ok:false,reason:'Maximum open paper positions reached.'};
-  if((s.dailyLoss||0)<=-(PAPER_CONFIG.startingBalance*PAPER_CONFIG.maxDailyLoss))return {ok:false,reason:'Daily loss limit reached.'};
-  if((s.lossStreak||0)>=PAPER_CONFIG.maxConsecutiveLosses)return {ok:false,reason:'Consecutive-loss circuit breaker active.'};
+  const maxOpen=numOr(rs.maxOpenTrades,PAPER_CONFIG.maxOpenTrades);
+  if((account.openPositions||[]).filter(p=>p.paper).length>=maxOpen)return {ok:false,reason:'Maximum open paper positions reached ('+maxOpen+').'};
+  const maxDailyLossPct=numOr(rs.maxDailyLoss,PAPER_CONFIG.maxDailyLoss*100);
+  const dailyLossLimit=paperSizingBalance(account.balance)*(maxDailyLossPct/100);
+  if((s.dailyLoss||0)<=-dailyLossLimit)return {ok:false,reason:'Daily loss limit reached ('+maxDailyLossPct+'% of balance).'};
+  const maxStreak=numOr(rs.losingStreak,PAPER_CONFIG.maxConsecutiveLosses);
+  if((s.lossStreak||0)>=maxStreak)return {ok:false,reason:'Consecutive-loss circuit breaker active ('+maxStreak+' losses in a row).'};
   return {ok:true};
 }
 const ZS_BUILD='2026-09-25.2';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
-function paperPositionSize(balance,entry,stop){
-  const risk=paperSizingBalance(balance)*PAPER_CONFIG.riskPerTrade;
+// riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
+// Falls back to the old hardcoded PAPER_CONFIG fraction only if no settings were passed in.
+function paperRiskPct(riskSettings){ return riskSettings&&Number.isFinite(Number(riskSettings.riskPerTrade))?Number(riskSettings.riskPerTrade)/100:PAPER_CONFIG.riskPerTrade; }
+function paperPositionSize(balance,entry,stop,riskSettings){
+  const risk=paperSizingBalance(balance)*paperRiskPct(riskSettings);
   const distance=Math.abs(entry-stop);
   return distance>0?risk/distance:0;
 }
-function createPaperPosition(signal,balance){
+function createPaperPosition(signal,balance,riskSettings){
   if(signal.direction==='NO TRADE')return null;
   const entry=signal.direction==='BUY'?signal.price*(1+PAPER_CONFIG.slippageBps/10000):signal.price*(1-PAPER_CONFIG.slippageBps/10000);
   const stop=signal.direction==='BUY'?entry-signal.stopDistance:entry+signal.stopDistance;
   const tp=signal.direction==='BUY'?entry+signal.stopDistance*2:entry-signal.stopDistance*2;
   return {
     id:'PT-'+Date.now(),dbId:zsGenId(),pair:signal.pair,dir:signal.direction,entry,sl:stop,tp,
-    size:paperPositionSize(balance,entry,stop),risk:paperSizingBalance(balance)*PAPER_CONFIG.riskPerTrade,
+    size:paperPositionSize(balance,entry,stop,riskSettings),risk:paperSizingBalance(balance)*paperRiskPct(riskSettings),
     strategy:signal.strategy,confidence:signal.confidence,openedAt:Date.now(),paper:true
   };
 }
@@ -825,7 +834,7 @@ function Login({onLogin}){
 // ═══════════════════════════════════════════
 // PAPER ENGINE CARD
 // ═══════════════════════════════════════════
-function PaperEngineCard({account,setAccount,showToast}){
+function PaperEngineCard({account,setAccount,showToast,riskSettings}){
   const[pair,setPair]=useState(()=>paperLoad(PAPER_LS.watchPair,PAPER_CONFIG.pair));
   const[signal,setSignal]=useState(()=>paperLoad(PAPER_LS.signal,{direction:'NO TRADE',confidence:0,reason:'Run the paper engine to evaluate the market.',evidence:[]}));
   const[busy,setBusy]=useState(false);
@@ -908,10 +917,10 @@ function PaperEngineCard({account,setAccount,showToast}){
 
   const paperTrade=()=>{
     const stats=paperLoad(PAPER_LS.stats,{dailyLoss:0,lossStreak:0,totalPnL:0});
-    const gate=paperRiskAllowed(stats,account);
+    const gate=paperRiskAllowed(stats,account,riskSettings);
     if(!gate.ok){showToast(gate.reason,'error');return}
     if(signal.direction==='NO TRADE'){showToast('No trade: the strategy has not produced a valid setup.','info');return}
-    const pos=createPaperPosition(signal,account.balance);
+    const pos=createPaperPosition(signal,account.balance,riskSettings);
     if(!pos){showToast('Could not create paper position.','error');return}
     setAccount({...account,openPositions:[...(account.openPositions||[]),pos],used:(account.used||0)+pos.risk});
     window.ZuShePaperDB?.openTrade?.(pos)?.catch?.(()=>{});
@@ -989,7 +998,7 @@ function PaperEngineCard({account,setAccount,showToast}){
       'Auto-refresh every 5 minutes (paper evaluation + real stop/target checks only)'
     ),
     e('div',{style:{fontSize:9,color:'var(--text3)',marginTop:8,lineHeight:1.4}},
-      'Risk: 1%/trade · Daily loss: 3% · Max open: 1 · Circuit breaker: 3 losses · Leverage: 0×. No API keys and no real orders. Open paper trades close only at real stop/target prices — never simulated.'
+      'Risk: '+(riskSettings?Number(riskSettings.riskPerTrade):(PAPER_CONFIG.riskPerTrade*100))+'%/trade · Daily loss: '+(riskSettings?riskSettings.maxDailyLoss:(PAPER_CONFIG.maxDailyLoss*100))+'% · Max open: '+(riskSettings?riskSettings.maxOpenTrades:PAPER_CONFIG.maxOpenTrades)+' · Circuit breaker: '+(riskSettings?riskSettings.losingStreak:PAPER_CONFIG.maxConsecutiveLosses)+' losses · Leverage: 0×. No API keys and no real orders. Open paper trades close only at real stop/target prices — never simulated.'
     )
   );
 }
@@ -997,7 +1006,7 @@ function PaperEngineCard({account,setAccount,showToast}){
 // ═══════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════
-function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,liveEquity,unrealizedTotal}){
+function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,liveEquity,unrealizedTotal,riskSettings}){
   const mkts=useMemo(()=>MARKETS.map(m=>({...m,ch:pchg(m.price,m.prev)})),[]);
   const openCount=account.openPositions.length;
   const activeStrats=strategies.filter(s=>s.status==='Demo Active').length;
@@ -1026,7 +1035,7 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,li
       e('span',{className:'mode-badge badge-demo'},'DEMO MODE')
     ),
     e('div',{className:'scroll'},
-      e(PaperEngineCard,{account,setAccount,showToast}),
+      e(PaperEngineCard,{account,setAccount,showToast,riskSettings}),
       // ── Top status bar ──
       e('div',{style:{padding:'10px 12px 6px',display:'flex',gap:8,overflowX:'auto'}},
         e('div',{style:{background:'var(--green-dim)',border:'1px solid rgba(16,217,122,.2)',borderRadius:8,padding:'6px 10px',flexShrink:0,display:'flex',alignItems:'center',gap:5}},
@@ -1234,11 +1243,11 @@ function zsEquityCurve(account,equity){
   pts.push(equity);
   return pts.slice(-60);
 }
-function mapDbSignalToUi(row,account){
+function mapDbSignalToUi(row,account,riskSettings){
   const wl=PAPER_CONFIG.watchlist.find(w=>w.id===row.pair);
   const entry=Number(row.entry_price)||0,sl=Number(row.stop_price)||0,tp=Number(row.take_profit)||0;
   const rr=Math.abs(sl-entry)>0?Math.abs(tp-entry)/Math.abs(sl-entry):0;
-  const size=paperPositionSize((account&&account.balance)||PAPER_CONFIG.startingBalance,entry,sl);
+  const size=paperPositionSize((account&&account.balance)||PAPER_CONFIG.startingBalance,entry,sl,riskSettings);
   const statusMap={pending:'Pending',accepted:'Accepted',watching:'Watching',rejected:'Rejected',expired:'Rejected'};
   return {
     id:row.id,
@@ -1246,7 +1255,7 @@ function mapDbSignalToUi(row,account){
     market:wl?wl.label:row.pair,
     dir:row.direction,
     entry,sl,tp,rr,
-    risk:(PAPER_CONFIG.riskPerTrade*100)+'%',
+    risk:(riskSettings?Number(riskSettings.riskPerTrade):(PAPER_CONFIG.riskPerTrade*100))+'%',
     size:size?size.toFixed(6)+' '+zsPairAsset(row.pair):'—',
     conf:Number(row.confidence)||0,
     strat:row.strategy,
@@ -1338,8 +1347,8 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     if(account.openPositions.length>=riskSettings.maxOpenTrades){
       showToast('Max open trades ('+riskSettings.maxOpenTrades+') already reached. Close a position first.','warning');return;
     }
-    const risk=parseFloat((paperSizingBalance(account.balance)*PAPER_CONFIG.riskPerTrade).toFixed(2));
-    const size=paperPositionSize(account.balance,sig.entry,sig.sl);
+    const risk=parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings)).toFixed(2));
+    const size=paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings);
     const pos={id:'PT-'+Date.now(),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size,risk,strategy:sig.strat,confidence:sig.conf,openedAt:Date.now(),paper:true,sigId:sig.id};
     setSignals(ss=>ss.map(s=>s.id===sig.id?{...s,status:'Accepted'}:s));
     setAccount(a=>({...a,openPositions:[...a.openPositions,pos],used:parseFloat((a.used+risk).toFixed(2))}));
@@ -1358,10 +1367,10 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     const chosen=cand.slice(0,room);
     if(!chosen.length){showToast('Max open trades ('+riskSettings.maxOpenTrades+') already reached. Close a position first.','warning');return;}
     const skippedN=cand.length-chosen.length;
-    if(!window.confirm('Open '+chosen.length+' paper trade'+(chosen.length>1?'s':'')+' now?'+(skippedN?'\n('+skippedN+' more will stay pending — open-trade limit reached.)':'')+'\n\nEach risks '+(PAPER_CONFIG.riskPerTrade*100)+'% of your paper balance.'))return;
+    if(!window.confirm('Open '+chosen.length+' paper trade'+(chosen.length>1?'s':'')+' now?'+(skippedN?'\n('+skippedN+' more will stay pending — open-trade limit reached.)':'')+'\n\nEach risks '+Number(riskSettings.riskPerTrade)+'% of your paper balance.'))return;
     const now=Date.now();
-    const perRisk=parseFloat((paperSizingBalance(account.balance)*PAPER_CONFIG.riskPerTrade).toFixed(2));
-    const newPos=chosen.map((sig,i)=>({id:'PT-'+(now+i),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size:paperPositionSize(account.balance,sig.entry,sig.sl),risk:perRisk,strategy:sig.strat,confidence:sig.conf,openedAt:now+i,paper:true,sigId:sig.id}));
+    const perRisk=parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings)).toFixed(2));
+    const newPos=chosen.map((sig,i)=>({id:'PT-'+(now+i),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size:paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings),risk:perRisk,strategy:sig.strat,confidence:sig.conf,openedAt:now+i,paper:true,sigId:sig.id}));
     const ids=new Set(chosen.map(s=>s.id));
     setSignals(ss=>ss.map(s=>ids.has(s.id)?{...s,status:'Accepted'}:s));
     setAccount(a=>({...a,openPositions:[...a.openPositions,...newPos],used:parseFloat((a.used+perRisk*newPos.length).toFixed(2))}));
@@ -3904,11 +3913,11 @@ function App(){
     setSignalsLoading(true);
     try{
       const rows=await window.ZuShePaperDB.loadSignals();
-      setSignals(rows.map(r=>mapDbSignalToUi(r,account)));
+      setSignals(rows.map(r=>mapDbSignalToUi(r,account,riskSettings)));
     }catch(err){
       console.warn('[ZuShé Trader] Could not load signals:',err?.message||err);
     }finally{setSignalsLoading(false);}
-  },[account]);
+  },[account,riskSettings]);
 
   useEffect(()=>{
     let cancelled=false;
@@ -3944,7 +3953,7 @@ function App(){
   };
 
   const SCREENS={
-    dashboard:e(Dashboard,{account,setAccount,signals,strategies,showToast,setScreen,liveEquity,unrealizedTotal}),
+    dashboard:e(Dashboard,{account,setAccount,signals,strategies,showToast,setScreen,liveEquity,unrealizedTotal,riskSettings}),
     signals:e(SignalDesk,{signals,setSignals,account,setAccount,showToast,riskSettings,refreshSignals,signalsLoading,livePrices}),
     evolution:e(EvolutionLab,{showToast}),
     portfolio:e(Portfolio,{account,setAccount,showToast,liveEquity,unrealizedTotal,livePrices}),
