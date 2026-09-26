@@ -506,6 +506,19 @@ function signalEvidence(ind){
   if(ind.atr>0)ev.push('ATR '+ind.atr.toFixed(0));
   return ev;
 }
+function zsClamp(v,lo,hi){return Math.max(lo,Math.min(hi,v));}
+// Turns the actual strength of the evidence into a confidence score, instead of
+// stamping every signal from a strategy with the same fixed number regardless of
+// how strong the setup is (a barely-qualifying trend and a textbook one used to
+// both read "72%"). This is a heuristic strength read, not a backtested/calibrated
+// win probability — treat higher as "more of the evidence lined up strongly",
+// not "will win X% of the time".
+// factors: [{value, cap, weight}] — each contributes up to `weight` points,
+// scaled by how far `value` sits toward `cap` (0..1, clamped both ends).
+function zsSignalConfidence(base,factors){
+  const bonus=factors.reduce((sum,f)=>sum+zsClamp(f.value/f.cap,0,1)*f.weight,0);
+  return Math.round(zsClamp(base+bonus,35,92));
+}
 function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair){
   if(candles.length<205)return {direction:'NO TRADE',confidence:0,reason:'Not enough historical candles yet.',evidence:[],pair};
   const x=marketIndicators(candles), ev=signalEvidence(x);
@@ -516,19 +529,71 @@ function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair)
   const volumeOk=x.volume>=x.avgVolume*0.8;
   const meanLong=x.price<x.bb.lower&&x.rsi<35;
   const meanShort=x.price>x.bb.upper&&x.rsi>65;
+  const atrSafe=x.atr||1, bandWidth=(x.bb.upper-x.bb.lower)||1;
+  const volExpansion=Math.max(0,x.volume/x.avgVolume-0.8);
   let direction='NO TRADE', confidence=0, reason='Conditions are not aligned.';
   if(strategy==='Trend'){
-    if(trendUp&&volumeOk){direction='BUY';confidence=72;reason='Trend alignment: price/EMA structure is bullish.'}
-    else if(trendDown&&volumeOk){direction='SELL';confidence=72;reason='Trend alignment: price/EMA structure is bearish.'}
+    if(trendUp&&volumeOk){
+      direction='BUY';reason='Trend alignment: price/EMA structure is bullish.';
+      confidence=zsSignalConfidence(58,[
+        {value:(x.price-x.ema200)/atrSafe,cap:3,weight:18},
+        {value:(x.ema20-x.ema50)/x.price*100,cap:1.5,weight:10},
+        {value:volExpansion,cap:0.7,weight:8}
+      ]);
+    }else if(trendDown&&volumeOk){
+      direction='SELL';reason='Trend alignment: price/EMA structure is bearish.';
+      confidence=zsSignalConfidence(58,[
+        {value:(x.ema200-x.price)/atrSafe,cap:3,weight:18},
+        {value:(x.ema50-x.ema20)/x.price*100,cap:1.5,weight:10},
+        {value:volExpansion,cap:0.7,weight:8}
+      ]);
+    }
   }else if(strategy==='Momentum'){
-    if(momentumUp&&volumeOk&&trendUp){direction='BUY';confidence=70;reason='Momentum and trend agree.'}
-    else if(momentumDown&&volumeOk&&trendDown){direction='SELL';confidence=70;reason='Downside momentum and trend agree.'}
+    if(momentumUp&&volumeOk&&trendUp){
+      direction='BUY';reason='Momentum and trend agree.';
+      confidence=zsSignalConfidence(56,[
+        {value:1-Math.abs(x.rsi-63.5)/8.5,cap:1,weight:14},
+        {value:(x.price-x.ema200)/atrSafe,cap:2.5,weight:10},
+        {value:volExpansion,cap:0.7,weight:10}
+      ]);
+    }else if(momentumDown&&volumeOk&&trendDown){
+      direction='SELL';reason='Downside momentum and trend agree.';
+      confidence=zsSignalConfidence(56,[
+        {value:1-Math.abs(x.rsi-36.5)/8.5,cap:1,weight:14},
+        {value:(x.ema200-x.price)/atrSafe,cap:2.5,weight:10},
+        {value:volExpansion,cap:0.7,weight:10}
+      ]);
+    }
   }else if(strategy==='Mean Reversion'){
-    if(meanLong){direction='BUY';confidence=68;reason='Price is extended below the lower Bollinger Band with RSI weakness.'}
-    else if(meanShort){direction='SELL';confidence=68;reason='Price is extended above the upper Bollinger Band with RSI strength.'}
+    if(meanLong){
+      direction='BUY';reason='Price is extended below the lower Bollinger Band with RSI weakness.';
+      confidence=zsSignalConfidence(54,[
+        {value:(x.bb.lower-x.price)/bandWidth,cap:0.5,weight:16},
+        {value:35-x.rsi,cap:15,weight:14}
+      ]);
+    }else if(meanShort){
+      direction='SELL';reason='Price is extended above the upper Bollinger Band with RSI strength.';
+      confidence=zsSignalConfidence(54,[
+        {value:(x.price-x.bb.upper)/bandWidth,cap:0.5,weight:16},
+        {value:x.rsi-65,cap:15,weight:14}
+      ]);
+    }
   }else{
-    if(trendUp&&momentumUp&&volumeOk){direction='BUY';confidence=78;reason='Combined trend, momentum and volume confirmation.'}
-    else if(trendDown&&momentumDown&&volumeOk){direction='SELL';confidence=78;reason='Combined bearish trend, momentum and volume confirmation.'}
+    if(trendUp&&momentumUp&&volumeOk){
+      direction='BUY';reason='Combined trend, momentum and volume confirmation.';
+      confidence=zsSignalConfidence(66,[
+        {value:(x.price-x.ema200)/atrSafe,cap:3,weight:10},
+        {value:1-Math.abs(x.rsi-63.5)/8.5,cap:1,weight:10},
+        {value:volExpansion,cap:0.7,weight:8}
+      ]);
+    }else if(trendDown&&momentumDown&&volumeOk){
+      direction='SELL';reason='Combined bearish trend, momentum and volume confirmation.';
+      confidence=zsSignalConfidence(66,[
+        {value:(x.ema200-x.price)/atrSafe,cap:3,weight:10},
+        {value:1-Math.abs(x.rsi-36.5)/8.5,cap:1,weight:10},
+        {value:volExpansion,cap:0.7,weight:8}
+      ]);
+    }
   }
   return {direction,confidence,reason,evidence:ev,price:x.price,stopDistance:Math.max(x.atr*1.5,x.price*0.008),indicators:x,timestamp:Date.now(),pair,strategy};
 }
