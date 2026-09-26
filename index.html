@@ -549,72 +549,57 @@ function zsOpportunityBonus(x,confidence){
 // Runs every strategy against one set of candles and returns every setup
 // that fires — same shape and thresholds as signal-scan's evaluateAll.
 function evaluateAllPaperSignals(candles){
-  if(candles.length<205)return [];
-  const x=marketIndicators(candles);
+  const closed=candles.length>1?candles.slice(0,-1):candles;
+  if(closed.length<205)return [];
+  const x=marketIndicators(closed);
   if(![x.price,x.ema20,x.ema50,x.ema200,x.rsi,x.atr].every(Number.isFinite))return [];
-  const ev=signalEvidence(x);
-  const n=candles.length;
-  const prev=candles.slice(n-21,n-1);
-  const hh=Math.max(...prev.map(c=>c.high));
-  const ll=Math.min(...prev.map(c=>c.low));
-
+  const ev=signalEvidence(x),n=closed.length,last=closed[n-1],prevCandle=closed[n-2];
+  const prev=closed.slice(n-21,n-1);
+  const hh=Math.max(...prev.map(c=>c.high)),ll=Math.min(...prev.map(c=>c.low));
   const trendUp=x.price>x.ema200&&x.ema20>x.ema50;
   const trendDown=x.price<x.ema200&&x.ema20<x.ema50;
-  const volLoose=x.volume>=x.avgVolume*0.5;
-  const volStrict=x.volume>=x.avgVolume*0.8;
-  const volSurge=x.volume>=x.avgVolume*1.2;
-
+  const bullish=last.close>last.open,bearish=last.close<last.open;
+  const rsiPrev=rsiSeries(closed.map(c=>c.close),14).slice(-2)[0];
+  const rsiRising=x.rsi>rsiPrev+1,rsiFalling=x.rsi<rsiPrev-1;
+  const volStrict=x.volume>=x.avgVolume*.8,volSurge=x.volume>=x.avgVolume*1.2;
+  const notExtUp=x.price<=x.ema20+1.15*x.atr,notExtDown=x.price>=x.ema20-1.15*x.atr;
   const out=[];
   const add=(strategy,direction,confidence,reason,stopMult,baseRr)=>{
-    const conf=Math.min(85,Math.round(confidence));
-    const bonus=zsOpportunityBonus(x,conf);
-    const rr=+(baseRr*(1+bonus)).toFixed(2);
-    const stretched=bonus>=0.5;
-    out.push({
-      strategy,direction,confidence:conf,
-      reason:reason+(stretched?' Target extended ('+rr+':1) on strong volume/volatility/trend confluence.':''),
-      stopDistance:Math.max(x.atr*stopMult,x.price*0.008),rr,price:x.price,evidence:ev,indicators:x
-    });
+    const conf=Math.min(92,Math.round(confidence)); if(conf<72)return;
+    const rr=+(baseRr*(volSurge?1.10:1)).toFixed(2);
+    out.push({strategy,direction,confidence:conf,reason:reason+(volSurge?' Volume expansion confirms participation.':''),
+      stopDistance:Math.max(x.atr*stopMult,x.price*.008),rr,price:x.price,evidence:ev,indicators:x});
   };
-
-  if(trendUp&&x.rsi>=50&&x.rsi<=75&&volLoose){
-    const strict=x.rsi>=55&&x.rsi<=72;
-    add('Combined','BUY',65+(strict?8:0)+(volStrict?5:0),'Combined trend, momentum and volume confirmation'+(strict&&volStrict?'.':' (relaxed thresholds).'),2.0,3);
-  }else if(trendDown&&x.rsi<=50&&x.rsi>=25&&volLoose){
-    const strict=x.rsi<=45&&x.rsi>=28;
-    add('Combined','SELL',65+(strict?8:0)+(volStrict?5:0),'Combined bearish trend, momentum and volume confirmation'+(strict&&volStrict?'.':' (relaxed thresholds).'),2.0,3);
+  if(trendUp&&x.rsi>=52&&x.rsi<=70&&volStrict&&bullish&&notExtUp){
+    add('Combined','BUY',72+(x.rsi>=55&&x.rsi<=66?6:0)+(volSurge?6:0)+(x.emaSpreadPct>.6?5:0)+(rsiRising?4:0),'Confirmed bullish trend, momentum and participation.',1.8,2);
+  }else if(trendDown&&x.rsi>=30&&x.rsi<=48&&volStrict&&bearish&&notExtDown){
+    add('Combined','SELL',72+(x.rsi>=34&&x.rsi<=45?6:0)+(volSurge?6:0)+(x.emaSpreadPct>.6?5:0)+(rsiFalling?4:0),'Confirmed bearish trend, momentum and participation.',1.8,2);
   }
-
-  if(trendUp&&volLoose){
-    add('Trend Rider','BUY',58+(x.rsi>=50&&x.rsi<=75?6:0)+(volStrict?4:0)+(x.ema20>x.ema50*1.002?4:0),'Uptrend: price above EMA200 and EMA20 above EMA50.',2.0,3);
-  }else if(trendDown&&volLoose){
-    add('Trend Rider','SELL',58+(x.rsi<=50&&x.rsi>=25?6:0)+(volStrict?4:0)+(x.ema20<x.ema50*0.998?4:0),'Downtrend: price below EMA200 and EMA20 below EMA50.',2.0,3);
+  if(trendUp&&x.rsi>=52&&x.rsi<=70&&volStrict&&bullish&&notExtUp){
+    add('Trend Rider','BUY',72+(x.emaSpreadPct>.6?6:0)+(volSurge?6:0)+(rsiRising?4:0),'Established uptrend with a confirmed bullish close.',1.8,2);
+  }else if(trendDown&&x.rsi>=30&&x.rsi<=48&&volStrict&&bearish&&notExtDown){
+    add('Trend Rider','SELL',72+(x.emaSpreadPct>.6?6:0)+(volSurge?6:0)+(rsiFalling?4:0),'Established downtrend with a confirmed bearish close.',1.8,2);
   }
-
-  if(x.rsi>=52&&x.rsi<=80&&x.ema20>x.ema50&&x.price>x.ema20&&volLoose){
-    add('Momentum','BUY',58+(x.rsi<=72?5:0)+(volStrict?4:0)+(trendUp?5:0),'Bullish momentum: RSI strong and price holding above EMA20.',1.6,2);
-  }else if(x.rsi<=48&&x.rsi>=20&&x.ema20<x.ema50&&x.price<x.ema20&&volLoose){
-    add('Momentum','SELL',58+(x.rsi>=28?5:0)+(volStrict?4:0)+(trendDown?5:0),'Bearish momentum: RSI weak and price staying below EMA20.',1.6,2);
+  if(x.rsi>=55&&x.rsi<=70&&x.ema20>x.ema50&&x.price>x.ema20&&volStrict&&bullish&&rsiRising&&notExtUp){
+    add('Momentum','BUY',76+(volSurge?6:0)+(trendUp?5:0),'Bullish momentum confirmed by rising RSI, EMA alignment and volume.',1.5,1.8);
+  }else if(x.rsi>=30&&x.rsi<=45&&x.ema20<x.ema50&&x.price<x.ema20&&volStrict&&bearish&&rsiFalling&&notExtDown){
+    add('Momentum','SELL',76+(volSurge?6:0)+(trendDown?5:0),'Bearish momentum confirmed by falling RSI, EMA alignment and volume.',1.5,1.8);
   }
-
-  if(x.price<x.bb.lower&&x.rsi<40){
-    add('Mean Reversion','BUY',58+(x.rsi<30?8:0)+(x.price>x.ema200?4:0)+(volSurge?3:0),'Oversold: price below the lower Bollinger Band with weak RSI — bounce setup.',1.8,2);
-  }else if(x.price>x.bb.upper&&x.rsi>60){
-    add('Mean Reversion','SELL',58+(x.rsi>70?8:0)+(x.price<x.ema200?4:0)+(volSurge?3:0),'Overbought: price above the upper Bollinger Band with strong RSI — pullback setup.',1.8,2);
+  if(x.price<x.bb.lower&&x.rsi<35&&bullish&&x.price>prevCandle.close){
+    add('Mean Reversion','BUY',74+(x.rsi<30?8:0)+(volSurge?5:0),'Oversold extension with a confirmed bullish reversal candle.',1.7,1.8);
+  }else if(x.price>x.bb.upper&&x.rsi>65&&bearish&&x.price<prevCandle.close){
+    add('Mean Reversion','SELL',74+(x.rsi>70?8:0)+(volSurge?5:0),'Overbought extension with a confirmed bearish reversal candle.',1.7,1.8);
   }
-
-  if(x.price>hh&&volLoose){
-    add('Breakout','BUY',58+(volSurge?8:0)+(trendUp?6:0)+(x.rsi<80?2:0),'Breakout: price closed above the previous 20-candle high.',2.0,3);
-  }else if(x.price<ll&&volLoose){
-    add('Breakout','SELL',58+(volSurge?8:0)+(trendDown?6:0)+(x.rsi>20?2:0),'Breakdown: price closed below the previous 20-candle low.',2.0,3);
+  if(x.price>hh&&volSurge&&bullish&&x.price-hh<=.75*x.atr){
+    add('Breakout','BUY',76+(trendUp?7:0)+(x.rsi>=55&&x.rsi<=72?5:0),'20-candle breakout with strong volume and controlled extension.',1.8,2);
+  }else if(x.price<ll&&volSurge&&bearish&&ll-x.price<=.75*x.atr){
+    add('Breakout','SELL',76+(trendDown?7:0)+(x.rsi>=28&&x.rsi<=45?5:0),'20-candle breakdown with strong volume and controlled extension.',1.8,2);
   }
-
-  if(trendUp&&x.price<=x.ema20+0.25*x.atr&&x.price>=x.ema50&&x.rsi>=38&&x.rsi<=58){
-    add('Pullback','BUY',62+(volStrict?4:0)+(x.rsi>=42&&x.rsi<=52?4:0),'Pullback in an uptrend: price dipped back to the EMA20/EMA50 zone.',1.6,2.5);
-  }else if(trendDown&&x.price>=x.ema20-0.25*x.atr&&x.price<=x.ema50&&x.rsi>=42&&x.rsi<=62){
-    add('Pullback','SELL',62+(volStrict?4:0)+(x.rsi>=48&&x.rsi<=58?4:0),'Rally in a downtrend: price bounced back to the EMA20/EMA50 zone.',1.6,2.5);
+  if(trendUp&&x.price<=x.ema20+.20*x.atr&&x.price>=x.ema50&&x.rsi>=42&&x.rsi<=56&&bullish&&x.price>prevCandle.close&&volStrict){
+    add('Pullback','BUY',74+(volSurge?6:0)+(x.rsi>=45&&x.rsi<=52?5:0),'Uptrend pullback with bullish rejection from the EMA zone.',1.5,1.9);
+  }else if(trendDown&&x.price>=x.ema20-.20*x.atr&&x.price<=x.ema50&&x.rsi>=44&&x.rsi<=58&&bearish&&x.price<prevCandle.close&&volStrict){
+    add('Pullback','SELL',74+(volSurge?6:0)+(x.rsi>=48&&x.rsi<=55?5:0),'Downtrend rally with bearish rejection from the EMA zone.',1.5,1.9);
   }
-
   return out;
 }
 function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair){
@@ -678,7 +663,7 @@ function paperRiskAllowed(stats,account,riskSettings,candidate){
   }
   return {ok:true};
 }
-const ZS_BUILD='2026-09-26.2';
+const ZS_BUILD='2026-09-27.1';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
@@ -735,6 +720,11 @@ async function runPaperEngine(strategy='Combined',pair=PAPER_CONFIG.pair){
   const snapshot={candles,lastPrice,updatedAt:Date.now(),pair};
   paperSave(PAPER_LS.market,snapshot);
   const signal=evaluatePaperSignal(candles,strategy,pair);
+  if(signal&&signal.direction!=='NO TRADE'&&Number.isFinite(lastPrice)&&lastPrice>0){
+    const drift=Math.abs(lastPrice-Number(signal.price||lastPrice))/Math.max(1,Number(signal.price||lastPrice));
+    if(drift<=0.006) signal.price=lastPrice;
+    else { signal.direction='NO TRADE'; signal.confidence=0; signal.reason='Signal invalidated: live entry moved more than 0.6% from the completed-candle setup.'; }
+  }
   paperSave(PAPER_LS.signal,signal);
   return {candles,ticker,lastPrice,signal};
 }
@@ -800,7 +790,7 @@ const JOURNAL_SEED=[
   {id:'j2',date:'2024-01-12',market:'NAS100',dir:'BUY',entry:18240,exit:18150,sl:18180,tp:18400,size:0.01,risk:60,pl:-90,strat:'Breakout Hunter NAS',conf:68,status:'Loss',notes:'Stop hit on news spike. Reduce size near news events.',tags:['breakout','news']},
 ];
 
-const RISK_SETTINGS_SEED={riskPerTrade:1,maxDailyLoss:15,maxWeeklyLoss:25,maxOpenTrades:40,maxPerMarket:12,maxPerStrategy:12,maxDD:30,losingStreak:12,minConfidence:60,allowOvernight:true,allowWeekend:false,allowNews:false,requireApproval:true,liveEnabled:false};
+const RISK_SETTINGS_SEED={riskPerTrade:1,maxDailyLoss:15,maxWeeklyLoss:25,maxOpenTrades:40,maxPerMarket:12,maxPerStrategy:12,maxDD:30,losingStreak:12,minConfidence:72,allowOvernight:true,allowWeekend:false,allowNews:false,requireApproval:true,liveEnabled:false};
 
 // ═══════════════════════════════════════════
 // HELPERS
@@ -979,10 +969,12 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
     openPaper.forEach(pos=>{
       const exit=evaluatePaperExit(pos,lastPrice);
       if(!exit)return;
-      const pl=parseFloat(((pos.dir==='BUY'?(exit.exitPrice-pos.entry):(pos.entry-exit.exitPrice))*(pos.size||0)).toFixed(2));
+      const grossPl=parseFloat(((pos.dir==='BUY'?(exit.exitPrice-pos.entry):(pos.entry-exit.exitPrice))*(pos.size||0)).toFixed(2));
+      const fee=zsRoundTripFee(pos.entry,exit.exitPrice,pos.size||0);
+      const pl=parseFloat((grossPl-fee).toFixed(2));
       const newBalance=parseFloat((account.balance+pl).toFixed(2));
       const newDailyPL=parseFloat(((account.dailyPL||0)+pl).toFixed(2));
-      const trade={...pos,exit:exit.exitPrice,pl,closeTime:new Date().toISOString(),status:exit.status,trigger:exit.trigger};
+      const trade={...pos,exit:exit.exitPrice,pl,grossPl,fee,slip:0,closeTime:new Date().toISOString(),status:pl>=0?'Win':'Loss',trigger:exit.trigger};
       recordPaperTradeResult(pl);
       setAccount(a=>({...a,
         balance:newBalance,
@@ -4004,9 +3996,9 @@ function App(){
   const[riskSettings,setRiskSettings]=useState(()=>{
     const saved=LS.get('za_risk',RISK_SETTINGS_SEED);
     // One-time bump (v2) so an already-saved conservative setup does not block accepting many signals for paper testing.
-    if(LS.get('za_risk_v',1)<2){
-      LS.set('za_risk_v',2);
-      return {...saved,maxOpenTrades:Math.max(saved.maxOpenTrades||1,40),maxDailyLoss:Math.max(saved.maxDailyLoss||3,15),maxWeeklyLoss:Math.max(saved.maxWeeklyLoss||8,25),maxPerMarket:Math.max(saved.maxPerMarket||1,12),maxPerStrategy:Math.max(saved.maxPerStrategy||1,12),maxDD:Math.max(saved.maxDD||15,30),losingStreak:Math.max(saved.losingStreak||3,12)};
+    if(LS.get('za_risk_v',1)<3){
+      LS.set('za_risk_v',3);
+      return {...saved,maxOpenTrades:Math.max(saved.maxOpenTrades||1,40),maxDailyLoss:Math.max(saved.maxDailyLoss||3,15),maxWeeklyLoss:Math.max(saved.maxWeeklyLoss||8,25),maxPerMarket:Math.max(saved.maxPerMarket||1,12),maxPerStrategy:Math.max(saved.maxPerStrategy||1,12),maxDD:Math.max(saved.maxDD||15,30),losingStreak:Math.max(saved.losingStreak||3,12),minConfidence:Math.max(saved.minConfidence||60,72)};
     }
     return saved;
   });
