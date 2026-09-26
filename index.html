@@ -403,6 +403,7 @@ const PAPER_LS={
   trades:'zsd_paper_trades',
   stats:'zsd_paper_stats',
   watchPair:'zsd_paper_watch_pair',
+  watchStrategy:'zsd_paper_watch_strategy',
   scan:'zsd_paper_scan',
   sentiment:'zsd_paper_sentiment'
 };
@@ -495,7 +496,14 @@ function marketIndicators(candles){
   const e20=emaSeries(closes,20),e50=emaSeries(closes,50),e200=emaSeries(closes,200);
   const rsi=rsiSeries(closes,14), atr=atrSeries(candles,14), bb=bbSeries(closes,20,2);
   const i=closes.length-1, avgVol=vols.slice(-20).reduce((a,b)=>a+b,0)/Math.max(1,Math.min(20,vols.length));
-  return {price:closes[i],ema20:e20[i],ema50:e50[i],ema200:e200[i],rsi:rsi[i],atr:atr[i],bb:bb[i],volume:vols[i],avgVolume:avgVol};
+  // atrRatio/emaSpreadPct mirror the signal-scan edge function exactly, so the
+  // interactive Paper Engine card's adaptive reward:risk (below) stretches
+  // targets the same way the server-generated Signal Desk signals do, instead
+  // of the two disagreeing on how good a "strong" setup looks.
+  const atrPrevIdx=Math.max(0,i-10);
+  const atrRatio=atr[atrPrevIdx]>0?atr[i]/atr[atrPrevIdx]:1;
+  const emaSpreadPct=closes[i]>0?Math.abs(e20[i]-e50[i])/closes[i]*100:0;
+  return {price:closes[i],ema20:e20[i],ema50:e50[i],ema200:e200[i],rsi:rsi[i],atr:atr[i],bb:bb[i],volume:vols[i],avgVolume:avgVol,atrRatio,emaSpreadPct};
 }
 function signalEvidence(ind){
   const ev=[];
@@ -519,83 +527,102 @@ function zsSignalConfidence(base,factors){
   const bonus=factors.reduce((sum,f)=>sum+zsClamp(f.value/f.cap,0,1)*f.weight,0);
   return Math.round(zsClamp(base+bonus,35,92));
 }
-function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair){
-  if(candles.length<205)return {direction:'NO TRADE',confidence:0,reason:'Not enough historical candles yet.',evidence:[],pair};
-  const x=marketIndicators(candles), ev=signalEvidence(x);
+// The 6 strategies the interactive Paper Engine card can evaluate — kept in
+// exact parity with the signal-scan edge function's list/order/thresholds/
+// confidence weights/adaptive-RR logic, so the same market conditions read
+// the same way whether you're looking at the card or Signal Desk. Previously
+// this card only ever ran a 4-strategy, fixed-2:1-RR "Combined" formula that
+// had drifted from the server; this closes that gap.
+const PAPER_STRATEGIES=['Combined','Trend Rider','Momentum','Mean Reversion','Breakout','Pullback'];
+// How much better than average this specific setup looks, based only on
+// things measurable right now (never a prediction of direction, only of "how
+// much room does this move plausibly have"). Mirrors signal-scan exactly.
+function zsOpportunityBonus(x,confidence){
+  const volSurge=x.volume>=x.avgVolume*1.2;
+  let b=0;
+  if(volSurge)b+=0.35;
+  if(x.atrRatio>1.15)b+=0.30;
+  if(x.emaSpreadPct>0.6)b+=0.25;
+  if(confidence>=75)b+=0.25;
+  return Math.min(b,1.2);
+}
+// Runs every strategy against one set of candles and returns every setup
+// that fires — same shape and thresholds as signal-scan's evaluateAll.
+function evaluateAllPaperSignals(candles){
+  if(candles.length<205)return [];
+  const x=marketIndicators(candles);
+  if(![x.price,x.ema20,x.ema50,x.ema200,x.rsi,x.atr].every(Number.isFinite))return [];
+  const ev=signalEvidence(x);
+  const n=candles.length;
+  const prev=candles.slice(n-21,n-1);
+  const hh=Math.max(...prev.map(c=>c.high));
+  const ll=Math.min(...prev.map(c=>c.low));
+
   const trendUp=x.price>x.ema200&&x.ema20>x.ema50;
   const trendDown=x.price<x.ema200&&x.ema20<x.ema50;
-  const momentumUp=x.rsi>=55&&x.rsi<=72;
-  const momentumDown=x.rsi<=45&&x.rsi>=28;
-  const volumeOk=x.volume>=x.avgVolume*0.8;
-  const meanLong=x.price<x.bb.lower&&x.rsi<35;
-  const meanShort=x.price>x.bb.upper&&x.rsi>65;
-  const atrSafe=x.atr||1, bandWidth=(x.bb.upper-x.bb.lower)||1;
-  const volExpansion=Math.max(0,x.volume/x.avgVolume-0.8);
-  let direction='NO TRADE', confidence=0, reason='Conditions are not aligned.';
-  if(strategy==='Trend'){
-    if(trendUp&&volumeOk){
-      direction='BUY';reason='Trend alignment: price/EMA structure is bullish.';
-      confidence=zsSignalConfidence(58,[
-        {value:(x.price-x.ema200)/atrSafe,cap:3,weight:18},
-        {value:(x.ema20-x.ema50)/x.price*100,cap:1.5,weight:10},
-        {value:volExpansion,cap:0.7,weight:8}
-      ]);
-    }else if(trendDown&&volumeOk){
-      direction='SELL';reason='Trend alignment: price/EMA structure is bearish.';
-      confidence=zsSignalConfidence(58,[
-        {value:(x.ema200-x.price)/atrSafe,cap:3,weight:18},
-        {value:(x.ema50-x.ema20)/x.price*100,cap:1.5,weight:10},
-        {value:volExpansion,cap:0.7,weight:8}
-      ]);
-    }
-  }else if(strategy==='Momentum'){
-    if(momentumUp&&volumeOk&&trendUp){
-      direction='BUY';reason='Momentum and trend agree.';
-      confidence=zsSignalConfidence(56,[
-        {value:1-Math.abs(x.rsi-63.5)/8.5,cap:1,weight:14},
-        {value:(x.price-x.ema200)/atrSafe,cap:2.5,weight:10},
-        {value:volExpansion,cap:0.7,weight:10}
-      ]);
-    }else if(momentumDown&&volumeOk&&trendDown){
-      direction='SELL';reason='Downside momentum and trend agree.';
-      confidence=zsSignalConfidence(56,[
-        {value:1-Math.abs(x.rsi-36.5)/8.5,cap:1,weight:14},
-        {value:(x.ema200-x.price)/atrSafe,cap:2.5,weight:10},
-        {value:volExpansion,cap:0.7,weight:10}
-      ]);
-    }
-  }else if(strategy==='Mean Reversion'){
-    if(meanLong){
-      direction='BUY';reason='Price is extended below the lower Bollinger Band with RSI weakness.';
-      confidence=zsSignalConfidence(54,[
-        {value:(x.bb.lower-x.price)/bandWidth,cap:0.5,weight:16},
-        {value:35-x.rsi,cap:15,weight:14}
-      ]);
-    }else if(meanShort){
-      direction='SELL';reason='Price is extended above the upper Bollinger Band with RSI strength.';
-      confidence=zsSignalConfidence(54,[
-        {value:(x.price-x.bb.upper)/bandWidth,cap:0.5,weight:16},
-        {value:x.rsi-65,cap:15,weight:14}
-      ]);
-    }
-  }else{
-    if(trendUp&&momentumUp&&volumeOk){
-      direction='BUY';reason='Combined trend, momentum and volume confirmation.';
-      confidence=zsSignalConfidence(66,[
-        {value:(x.price-x.ema200)/atrSafe,cap:3,weight:10},
-        {value:1-Math.abs(x.rsi-63.5)/8.5,cap:1,weight:10},
-        {value:volExpansion,cap:0.7,weight:8}
-      ]);
-    }else if(trendDown&&momentumDown&&volumeOk){
-      direction='SELL';reason='Combined bearish trend, momentum and volume confirmation.';
-      confidence=zsSignalConfidence(66,[
-        {value:(x.ema200-x.price)/atrSafe,cap:3,weight:10},
-        {value:1-Math.abs(x.rsi-36.5)/8.5,cap:1,weight:10},
-        {value:volExpansion,cap:0.7,weight:8}
-      ]);
-    }
+  const volLoose=x.volume>=x.avgVolume*0.5;
+  const volStrict=x.volume>=x.avgVolume*0.8;
+  const volSurge=x.volume>=x.avgVolume*1.2;
+
+  const out=[];
+  const add=(strategy,direction,confidence,reason,stopMult,baseRr)=>{
+    const conf=Math.min(85,Math.round(confidence));
+    const bonus=zsOpportunityBonus(x,conf);
+    const rr=+(baseRr*(1+bonus)).toFixed(2);
+    const stretched=bonus>=0.5;
+    out.push({
+      strategy,direction,confidence:conf,
+      reason:reason+(stretched?' Target extended ('+rr+':1) on strong volume/volatility/trend confluence.':''),
+      stopDistance:Math.max(x.atr*stopMult,x.price*0.008),rr,price:x.price,evidence:ev,indicators:x
+    });
+  };
+
+  if(trendUp&&x.rsi>=50&&x.rsi<=75&&volLoose){
+    const strict=x.rsi>=55&&x.rsi<=72;
+    add('Combined','BUY',65+(strict?8:0)+(volStrict?5:0),'Combined trend, momentum and volume confirmation'+(strict&&volStrict?'.':' (relaxed thresholds).'),2.0,3);
+  }else if(trendDown&&x.rsi<=50&&x.rsi>=25&&volLoose){
+    const strict=x.rsi<=45&&x.rsi>=28;
+    add('Combined','SELL',65+(strict?8:0)+(volStrict?5:0),'Combined bearish trend, momentum and volume confirmation'+(strict&&volStrict?'.':' (relaxed thresholds).'),2.0,3);
   }
-  return {direction,confidence,reason,evidence:ev,price:x.price,stopDistance:Math.max(x.atr*1.5,x.price*0.008),indicators:x,timestamp:Date.now(),pair,strategy};
+
+  if(trendUp&&volLoose){
+    add('Trend Rider','BUY',58+(x.rsi>=50&&x.rsi<=75?6:0)+(volStrict?4:0)+(x.ema20>x.ema50*1.002?4:0),'Uptrend: price above EMA200 and EMA20 above EMA50.',2.0,3);
+  }else if(trendDown&&volLoose){
+    add('Trend Rider','SELL',58+(x.rsi<=50&&x.rsi>=25?6:0)+(volStrict?4:0)+(x.ema20<x.ema50*0.998?4:0),'Downtrend: price below EMA200 and EMA20 below EMA50.',2.0,3);
+  }
+
+  if(x.rsi>=52&&x.rsi<=80&&x.ema20>x.ema50&&x.price>x.ema20&&volLoose){
+    add('Momentum','BUY',58+(x.rsi<=72?5:0)+(volStrict?4:0)+(trendUp?5:0),'Bullish momentum: RSI strong and price holding above EMA20.',1.6,2);
+  }else if(x.rsi<=48&&x.rsi>=20&&x.ema20<x.ema50&&x.price<x.ema20&&volLoose){
+    add('Momentum','SELL',58+(x.rsi>=28?5:0)+(volStrict?4:0)+(trendDown?5:0),'Bearish momentum: RSI weak and price staying below EMA20.',1.6,2);
+  }
+
+  if(x.price<x.bb.lower&&x.rsi<40){
+    add('Mean Reversion','BUY',58+(x.rsi<30?8:0)+(x.price>x.ema200?4:0)+(volSurge?3:0),'Oversold: price below the lower Bollinger Band with weak RSI — bounce setup.',1.8,2);
+  }else if(x.price>x.bb.upper&&x.rsi>60){
+    add('Mean Reversion','SELL',58+(x.rsi>70?8:0)+(x.price<x.ema200?4:0)+(volSurge?3:0),'Overbought: price above the upper Bollinger Band with strong RSI — pullback setup.',1.8,2);
+  }
+
+  if(x.price>hh&&volLoose){
+    add('Breakout','BUY',58+(volSurge?8:0)+(trendUp?6:0)+(x.rsi<80?2:0),'Breakout: price closed above the previous 20-candle high.',2.0,3);
+  }else if(x.price<ll&&volLoose){
+    add('Breakout','SELL',58+(volSurge?8:0)+(trendDown?6:0)+(x.rsi>20?2:0),'Breakdown: price closed below the previous 20-candle low.',2.0,3);
+  }
+
+  if(trendUp&&x.price<=x.ema20+0.25*x.atr&&x.price>=x.ema50&&x.rsi>=38&&x.rsi<=58){
+    add('Pullback','BUY',62+(volStrict?4:0)+(x.rsi>=42&&x.rsi<=52?4:0),'Pullback in an uptrend: price dipped back to the EMA20/EMA50 zone.',1.6,2.5);
+  }else if(trendDown&&x.price>=x.ema20-0.25*x.atr&&x.price<=x.ema50&&x.rsi>=42&&x.rsi<=62){
+    add('Pullback','SELL',62+(volStrict?4:0)+(x.rsi>=48&&x.rsi<=58?4:0),'Rally in a downtrend: price bounced back to the EMA20/EMA50 zone.',1.6,2.5);
+  }
+
+  return out;
+}
+function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair){
+  if(candles.length<205)return {direction:'NO TRADE',confidence:0,reason:'Not enough historical candles yet.',evidence:[],pair,strategy};
+  const sigs=evaluateAllPaperSignals(candles);
+  const match=sigs.find(s=>s.strategy===strategy);
+  if(!match)return {direction:'NO TRADE',confidence:0,reason:'Conditions are not aligned for '+strategy+'.',evidence:[],pair,strategy,price:sigs[0]?.price};
+  return {...match,pair,timestamp:Date.now()};
 }
 // Cape Town-local calendar day, used so "daily" loss/streak tracking actually
 // means today rather than an all-time total that never resets.
@@ -651,7 +678,7 @@ function paperRiskAllowed(stats,account,riskSettings,candidate){
   }
   return {ok:true};
 }
-const ZS_BUILD='2026-09-26.1';
+const ZS_BUILD='2026-09-26.2';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
@@ -679,7 +706,8 @@ function createPaperPosition(signal,balance,riskSettings){
   if(signal.direction==='NO TRADE')return null;
   const entry=signal.direction==='BUY'?signal.price*(1+PAPER_CONFIG.slippageBps/10000):signal.price*(1-PAPER_CONFIG.slippageBps/10000);
   const stop=signal.direction==='BUY'?entry-signal.stopDistance:entry+signal.stopDistance;
-  const tp=signal.direction==='BUY'?entry+signal.stopDistance*2:entry-signal.stopDistance*2;
+  const rr=Number.isFinite(Number(signal.rr))?Number(signal.rr):2;
+  const tp=signal.direction==='BUY'?entry+signal.stopDistance*rr:entry-signal.stopDistance*rr;
   return {
     id:'PT-'+Date.now(),dbId:zsGenId(),pair:signal.pair,dir:signal.direction,entry,sl:stop,tp,
     size:paperPositionSize(balance,entry,stop,riskSettings),risk:paperSizingBalance(balance)*paperRiskPct(riskSettings),
@@ -931,6 +959,7 @@ function Login({onLogin}){
 // ═══════════════════════════════════════════
 function PaperEngineCard({account,setAccount,showToast,riskSettings}){
   const[pair,setPair]=useState(()=>paperLoad(PAPER_LS.watchPair,PAPER_CONFIG.pair));
+  const[strategy,setStrategy]=useState(()=>paperLoad(PAPER_LS.watchStrategy,'Combined'));
   const[signal,setSignal]=useState(()=>paperLoad(PAPER_LS.signal,{direction:'NO TRADE',confidence:0,reason:'Run the paper engine to evaluate the market.',evidence:[]}));
   const[busy,setBusy]=useState(false);
   const[scanning,setScanning]=useState(false);
@@ -968,11 +997,11 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
     });
   },[account,setAccount,showToast]);
 
-  const run=async(targetPair=pair)=>{
+  const run=async(targetPair=pair,targetStrategy=strategy)=>{
     if(busy)return;
     setBusy(true);
     try{
-      const r=await runPaperEngine('Combined',targetPair);
+      const r=await runPaperEngine(targetStrategy,targetPair);
       setSignal(r.signal); setMarket({lastPrice:r.lastPrice,updatedAt:Date.now(),pair:targetPair});
       setDataOk(true);
       checkExits(targetPair,r.lastPrice);
@@ -989,7 +1018,7 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
     if(scanning)return;
     setScanning(true);
     try{
-      const results=await scanWatchlist('Combined');
+      const results=await scanWatchlist(strategy);
       setScan({results,updatedAt:Date.now()});
       const best=results.find(r=>r.ok&&r.direction!=='NO TRADE');
       showToast(best?('Scan complete — best setup: '+best.label+' '+best.direction):'Scan complete — no qualifying setups right now.','info');
@@ -1000,7 +1029,12 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
 
   const focusPair=(id)=>{
     setPair(id); paperSave(PAPER_LS.watchPair,id);
-    run(id);
+    run(id,strategy);
+  };
+
+  const focusStrategy=(s)=>{
+    setStrategy(s); paperSave(PAPER_LS.watchStrategy,s);
+    run(pair,s);
   };
 
   const loadSentiment=async()=>{
@@ -1028,10 +1062,10 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
 
   useEffect(()=>{
     if(!auto)return;
-    const id=setInterval(()=>run(pair),300000);
-    run(pair);
+    const id=setInterval(()=>run(pair,strategy),300000);
+    run(pair,strategy);
     return()=>clearInterval(id);
-  },[auto]);
+  },[auto,strategy]);
 
   const c=signal.direction==='BUY'?'var(--green)':signal.direction==='SELL'?'var(--red)':'var(--amber)';
   const freshMs=Date.now()-(market.updatedAt||0);
@@ -1049,13 +1083,21 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
         e('span',{style:{fontSize:8,fontFamily:'var(--mono)',color:liveColor,fontWeight:700}},liveState)
       )
     ),
-    e('div',{style:{display:'flex',gap:5,marginBottom:9,flexWrap:'wrap'}},
+    e('div',{style:{display:'flex',gap:5,marginBottom:6,flexWrap:'wrap'}},
       ...PAPER_CONFIG.watchlist.map(w=>e('button',{key:w.id,onClick:()=>focusPair(w.id),disabled:busy,
         className:'btn',
         style:{flex:'1 1 auto',padding:'6px 8px',fontSize:10,fontWeight:700,
           background:w.id===pair?'rgba(0,229,204,.18)':'var(--glass2)',
           border:w.id===pair?'1px solid var(--cyan)':'1px solid transparent',color:w.id===pair?'var(--cyan)':'var(--text2)'}},
         w.label))
+    ),
+    e('div',{style:{display:'flex',gap:5,marginBottom:9,flexWrap:'wrap'}},
+      ...PAPER_STRATEGIES.map(s=>e('button',{key:s,onClick:()=>focusStrategy(s),disabled:busy,
+        className:'btn',
+        style:{flex:'1 1 auto',padding:'5px 7px',fontSize:9,fontWeight:700,
+          background:s===strategy?'rgba(16,217,122,.18)':'var(--glass2)',
+          border:s===strategy?'1px solid var(--green)':'1px solid transparent',color:s===strategy?'var(--green)':'var(--text3)'}},
+        s))
     ),
     e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:10}},
       e('div',{style:{background:'var(--glass2)',padding:9,borderRadius:8}},e('div',{style:{fontSize:9,color:'var(--text3)'}},'PAPER EQUITY'),e('div',{style:{fontSize:18,fontWeight:800,fontFamily:'var(--mono)'}},'R '+Number(account.balance||0).toFixed(2))),
@@ -1066,7 +1108,7 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
       e('strong',{style:{color:sentiment.value>=55?'var(--green)':sentiment.value<=45?'var(--red)':'var(--amber)'}},sentiment.value+' · '+sentiment.label)
     ):null,
     e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}},
-      e('span',{style:{fontSize:12,color:'var(--text2)'}},'Combined strategy'),
+      e('span',{style:{fontSize:12,color:'var(--text2)'}},strategy+' strategy'+(signal.confidence?' · '+signal.confidence+'% conf':'')),
       e('strong',{style:{fontFamily:'var(--mono)',color:c}},signal.direction)
     ),
     e('div',{style:{fontSize:11,color:'var(--text2)',lineHeight:1.5,marginBottom:8}},signal.reason),
