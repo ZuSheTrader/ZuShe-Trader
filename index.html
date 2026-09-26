@@ -375,7 +375,7 @@ const PAPER_CONFIG={
   maxOpenTrades:1,
   maxConsecutiveLosses:3,
   leverage:0,
-  feeRate:0.006,       // conservative placeholder; verify against current account fee tier
+  takerFeeRate:0.001,  // per-leg taker fee, mirrors paper-exit-check's TAKER_FEE_RATE server-side
   slippageBps:8,
   candleLimit:220,
   paperOnly:true
@@ -620,18 +620,35 @@ function recordPaperTradeResult(pl){
   return updated;
 }
 
-function paperRiskAllowed(stats,account,riskSettings){
+// candidate (optional): {pair,strategy} of the signal being considered, so the
+// per-market / per-strategy concentration limits below can actually check it.
+// These two limits (maxPerMarket, maxPerStrategy) already existed in the Risk
+// Vault UI but were never read anywhere — which is exactly how a full batch of
+// correlated crypto signals (all 4 watchlist pairs move together) could pile
+// up same-direction across every open-trade slot at once.
+function paperRiskAllowed(stats,account,riskSettings,candidate){
   const rs=riskSettings||RISK_SETTINGS_SEED;
   const numOr=(v,d)=>Number.isFinite(Number(v))?Number(v):d;
   const today=paperTzDate();
   const s=stats&&stats.date===today?stats:{dailyLoss:0,lossStreak:0};
+  const openPaper=(account.openPositions||[]).filter(p=>p.paper);
   const maxOpen=numOr(rs.maxOpenTrades,PAPER_CONFIG.maxOpenTrades);
-  if((account.openPositions||[]).filter(p=>p.paper).length>=maxOpen)return {ok:false,reason:'Maximum open paper positions reached ('+maxOpen+').'};
+  if(openPaper.length>=maxOpen)return {ok:false,reason:'Maximum open paper positions reached ('+maxOpen+').'};
   const maxDailyLossPct=numOr(rs.maxDailyLoss,PAPER_CONFIG.maxDailyLoss*100);
   const dailyLossLimit=paperSizingBalance(account.balance)*(maxDailyLossPct/100);
   if((s.dailyLoss||0)<=-dailyLossLimit)return {ok:false,reason:'Daily loss limit reached ('+maxDailyLossPct+'% of balance).'};
   const maxStreak=numOr(rs.losingStreak,PAPER_CONFIG.maxConsecutiveLosses);
   if((s.lossStreak||0)>=maxStreak)return {ok:false,reason:'Consecutive-loss circuit breaker active ('+maxStreak+' losses in a row).'};
+  if(candidate&&candidate.pair){
+    const maxPerMarket=numOr(rs.maxPerMarket,Infinity);
+    const marketOpen=openPaper.filter(p=>p.pair===candidate.pair).length;
+    if(marketOpen>=maxPerMarket)return {ok:false,reason:'Max trades per market reached for '+candidate.pair+' ('+maxPerMarket+'). This limit exists so correlated pairs (BTC/ETH/XRP/LTC move together) cannot all stack the same direction.'};
+  }
+  if(candidate&&candidate.strategy){
+    const maxPerStrategy=numOr(rs.maxPerStrategy,Infinity);
+    const stratOpen=openPaper.filter(p=>(p.strategy||p.strat)===candidate.strategy).length;
+    if(stratOpen>=maxPerStrategy)return {ok:false,reason:'Max trades per strategy reached for '+candidate.strategy+' ('+maxPerStrategy+').'};
+  }
   return {ok:true};
 }
 const ZS_BUILD='2026-09-25.2';
@@ -640,10 +657,23 @@ function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
 // Falls back to the old hardcoded PAPER_CONFIG fraction only if no settings were passed in.
 function paperRiskPct(riskSettings){ return riskSettings&&Number.isFinite(Number(riskSettings.riskPerTrade))?Number(riskSettings.riskPerTrade)/100:PAPER_CONFIG.riskPerTrade; }
+// Fee-aware sizing. The round-trip taker fee (paper-exit-check charges
+// (entry*qty + exit*qty) * TAKER_FEE_RATE, mirrored client-side as
+// PAPER_CONFIG.takerFeeRate) is billed on notional, not on how far price
+// moved — so on a tight stop it can eat a large slice of the risk you
+// thought you were taking, on top of the stop-loss itself. Previously size
+// was risk/distance with the fee coming out of the account afterwards,
+// unbudgeted; now the fee is folded into the sizing equation so that a full
+// stop-out (gross loss + fee, using stop price as the fee-basis estimate)
+// costs the risk amount you actually set, not risk-plus-a-hidden-extra.
 function paperPositionSize(balance,entry,stop,riskSettings){
-  const risk=paperSizingBalance(balance)*paperRiskPct(riskSettings);
+  const riskBudget=paperSizingBalance(balance)*paperRiskPct(riskSettings);
   const distance=Math.abs(entry-stop);
-  return distance>0?risk/distance:0;
+  if(distance<=0)return 0;
+  const feeRate=PAPER_CONFIG.takerFeeRate;
+  const feePerUnit=(Number(entry)+Number(stop))*feeRate; // ≈ round-trip fee per unit of size
+  const denom=distance+feePerUnit;
+  return denom>0?riskBudget/denom:0;
 }
 function createPaperPosition(signal,balance,riskSettings){
   if(signal.direction==='NO TRADE')return null;
@@ -742,7 +772,7 @@ const JOURNAL_SEED=[
   {id:'j2',date:'2024-01-12',market:'NAS100',dir:'BUY',entry:18240,exit:18150,sl:18180,tp:18400,size:0.01,risk:60,pl:-90,strat:'Breakout Hunter NAS',conf:68,status:'Loss',notes:'Stop hit on news spike. Reduce size near news events.',tags:['breakout','news']},
 ];
 
-const RISK_SETTINGS_SEED={riskPerTrade:1,maxDailyLoss:15,maxWeeklyLoss:25,maxOpenTrades:40,maxPerMarket:12,maxPerStrategy:12,maxDD:30,losingStreak:12,allowOvernight:true,allowWeekend:false,allowNews:false,requireApproval:true,liveEnabled:false};
+const RISK_SETTINGS_SEED={riskPerTrade:1,maxDailyLoss:15,maxWeeklyLoss:25,maxOpenTrades:40,maxPerMarket:12,maxPerStrategy:12,maxDD:30,losingStreak:12,minConfidence:60,allowOvernight:true,allowWeekend:false,allowNews:false,requireApproval:true,liveEnabled:false};
 
 // ═══════════════════════════════════════════
 // HELPERS
@@ -982,7 +1012,7 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
 
   const paperTrade=()=>{
     const stats=paperLoad(PAPER_LS.stats,{dailyLoss:0,lossStreak:0,totalPnL:0});
-    const gate=paperRiskAllowed(stats,account,riskSettings);
+    const gate=paperRiskAllowed(stats,account,riskSettings,{pair:signal.pair,strategy:signal.strategy});
     if(!gate.ok){showToast(gate.reason,'error');return}
     if(signal.direction==='NO TRADE'){showToast('No trade: the strategy has not produced a valid setup.','info');return}
     const pos=createPaperPosition(signal,account.balance,riskSettings);
@@ -1409,9 +1439,9 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   const acceptSig=(sig)=>{
     if(sig.dir==='NO TRADE'){showToast('This is not a real setup — nothing to accept.','info');return;}
     if(sig.tradable===false){showToast(sig.pair+' has no live price feed, so it cannot auto-close as a paper trade. Use Watch Only to track it manually.','info');return;}
-    if(account.openPositions.length>=riskSettings.maxOpenTrades){
-      showToast('Max open trades ('+riskSettings.maxOpenTrades+') already reached. Close a position first.','warning');return;
-    }
+    const stats=paperLoad(PAPER_LS.stats,{dailyLoss:0,lossStreak:0,totalPnL:0});
+    const gate=paperRiskAllowed(stats,account,riskSettings,{pair:sig.pair,strategy:sig.strat});
+    if(!gate.ok){showToast(gate.reason,'warning');return;}
     const risk=parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings)).toFixed(2));
     const size=paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings);
     const pos={id:'PT-'+Date.now(),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size,risk,strategy:sig.strat,confidence:sig.conf,openedAt:Date.now(),paper:true,sigId:sig.id};
@@ -1423,16 +1453,50 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     setShowDetail(null);
   };
 
-  // Accept every pending, tradable signal in one go (up to the open-trade limit) so many
-  // paper trades can run side by side and be compared by strategy / timeframe / pair.
+  // Accept pending, tradable signals up to the open-trade limit — but now
+  // ranked and gated instead of taken in raw list order:
+  //  1. Anything below Min Confidence (Risk Vault) is excluded outright.
+  //  2. What's left is filled highest-confidence-first, not list order.
+  //  3. Each candidate is checked against Max Per Market / Max Per Strategy as
+  //     it's added (counting both existing open positions AND ones already
+  //     chosen earlier in this same batch) — this is the fix for a batch of
+  //     correlated same-direction crypto signals filling every open slot at
+  //     once, which is exactly what produced 50 simultaneous same-side losers.
   const acceptAllPending=()=>{
     const cand=pending.filter(s=>s.dir!=='NO TRADE'&&s.tradable!==false);
     if(!cand.length){showToast('No tradable pending signals to accept.','info');return;}
+    const minConf=Number.isFinite(Number(riskSettings.minConfidence))?Number(riskSettings.minConfidence):0;
+    const qualified=cand.filter(s=>(s.conf||0)>=minConf).sort((a,b)=>(b.conf||0)-(a.conf||0));
+    const belowConfN=cand.length-qualified.length;
+    if(!qualified.length){showToast('No pending signals meet the minimum confidence ('+minConf+'%) to accept. Lower it in Risk Vault if you want to include weaker setups.','info');return;}
+
     const room=Math.max(0,riskSettings.maxOpenTrades-account.openPositions.length);
-    const chosen=cand.slice(0,room);
-    if(!chosen.length){showToast('Max open trades ('+riskSettings.maxOpenTrades+') already reached. Close a position first.','warning');return;}
-    const skippedN=cand.length-chosen.length;
-    if(!window.confirm('Open '+chosen.length+' paper trade'+(chosen.length>1?'s':'')+' now?'+(skippedN?'\n('+skippedN+' more will stay pending — open-trade limit reached.)':'')+'\n\nEach risks '+Number(riskSettings.riskPerTrade)+'% of your paper balance.'))return;
+    const maxPerMarket=Number.isFinite(Number(riskSettings.maxPerMarket))?Number(riskSettings.maxPerMarket):Infinity;
+    const maxPerStrategy=Number.isFinite(Number(riskSettings.maxPerStrategy))?Number(riskSettings.maxPerStrategy):Infinity;
+    const marketCount={},stratCount={};
+    (account.openPositions||[]).filter(p=>p.paper).forEach(p=>{
+      marketCount[p.pair]=(marketCount[p.pair]||0)+1;
+      const st=p.strategy||p.strat;if(st)stratCount[st]=(stratCount[st]||0)+1;
+    });
+    const chosen=[];let skippedConcentration=0;
+    for(const sig of qualified){
+      if(chosen.length>=room)break;
+      const mCount=marketCount[sig.pair]||0,sCount=stratCount[sig.strat]||0;
+      if(mCount>=maxPerMarket||sCount>=maxPerStrategy){skippedConcentration++;continue;}
+      chosen.push(sig);
+      marketCount[sig.pair]=mCount+1;
+      stratCount[sig.strat]=sCount+1;
+    }
+    if(!chosen.length){
+      showToast(skippedConcentration?'Every qualifying signal is blocked by Max Per Market/Strategy limits in Risk Vault. Raise those limits or close a position first.':'Max open trades ('+riskSettings.maxOpenTrades+') already reached. Close a position first.','warning');
+      return;
+    }
+    const skippedRoom=Math.max(0,qualified.length-chosen.length-skippedConcentration);
+    const noteParts=[];
+    if(belowConfN)noteParts.push(belowConfN+' below '+minConf+'% confidence');
+    if(skippedConcentration)noteParts.push(skippedConcentration+' blocked by per-market/strategy limits');
+    if(skippedRoom)noteParts.push(skippedRoom+' beyond the open-trade limit');
+    if(!window.confirm('Open '+chosen.length+' paper trade'+(chosen.length>1?'s':'')+' now, highest confidence first?'+(noteParts.length?'\n('+noteParts.join(', ')+' will stay pending.)':'')+'\n\nEach risks '+Number(riskSettings.riskPerTrade)+'% of your paper balance.'))return;
     const now=Date.now();
     const perRisk=parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings)).toFixed(2));
     const newPos=chosen.map((sig,i)=>({id:'PT-'+(now+i),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size:paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings),risk:perRisk,strategy:sig.strat,confidence:sig.conf,openedAt:now+i,paper:true,sigId:sig.id}));
@@ -2088,7 +2152,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
         e('span',null,'Exit ',e('span',{style:{fontFamily:'var(--mono)',color:'var(--text2)'}},t.exit))
       ),
       e('div',{style:{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--text3)'}},
-        e('span',null,t.strat||t.strategy||'Manual'),
+        e('span',null,(t.strat||t.strategy||'Manual')+(Number(t.confidence)>0?' · '+Math.round(t.confidence)+'% conf':'')),
         e('span',null,dur+' · '+(t.closeTime?new Date(t.closeTime).toLocaleDateString([],{day:'2-digit',month:'short'})+' '+new Date(t.closeTime).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'Today'))
       ),
       // Cost breakdown — only shown once a trade actually carries a fee, so
@@ -2215,7 +2279,10 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
                     e('span',{className:'pill '+(pos.dir==='BUY'?'pill-buy':'pill-sell')},pos.dir==='BUY'?'▲ BUY':'▼ SELL'),
                     e('span',{style:{fontWeight:800,fontSize:15}},pos.market||zsPairAsset(pos.pair))
                   ),
-                  e('div',{style:{fontSize:11,color:'var(--text3)'}},pos.strat||pos.strategy)
+                  e('div',{style:{display:'flex',alignItems:'center',gap:6}},
+                    e('span',{style:{fontSize:11,color:'var(--text3)'}},pos.strat||pos.strategy),
+                    Number(pos.confidence)>0&&e('span',{style:{fontSize:9,fontFamily:'var(--mono)',color:pos.confidence>79?'var(--green)':pos.confidence>65?'var(--amber)':'var(--text3)'}},'· '+Math.round(pos.confidence)+'% conf')
+                  )
                 ),
                 e('div',{style:{textAlign:'right'}},
                   e('div',{style:{fontSize:10,color:'var(--text3)'}},'At risk'),
@@ -2925,7 +2992,10 @@ function RiskVault({riskSettings,setRiskSettings,account,showToast}){
           inputEl:e(NumInput,{k:'maxPerMarket',min:1,max:10})}),
         e(RuleRow,{label:'Max Trades Per Strategy',
           desc:'Limits how many simultaneous positions a single strategy can open. Prevents one strategy from dominating your entire account.',
-          inputEl:e(NumInput,{k:'maxPerStrategy',min:1,max:10})})
+          inputEl:e(NumInput,{k:'maxPerStrategy',min:1,max:10})}),
+        e(RuleRow,{label:'Min Confidence to Accept (%)',
+          desc:'"Accept All Pending" in Signal Desk skips anything below this confidence and fills your open-trade slots with the highest-confidence signals first, instead of whatever is at the top of the list.',
+          inputEl:e(NumInput,{k:'minConfidence',min:0,max:90,step:1})})
       ),
 
       // Loss limits
@@ -2996,6 +3066,7 @@ function LiveReadiness({showToast}){
   const[rows,setRows]=useState([]);
   const[flags,setFlags]=useState(null);
   const[loading,setLoading]=useState(false);
+  const[resetting,setResetting]=useState(false);
 
   const load=useCallback(async()=>{
     if(!window.ZuShePaperDB)return;
@@ -3013,6 +3084,28 @@ function LiveReadiness({showToast}){
       setLoading(false);
     }
   },[showToast]);
+
+  // Sets a cutover timestamp server-side (trader_system_flags.stats_reset_at). The
+  // strategy-review edge function then only counts trades that CLOSED at/after this
+  // moment toward the 50-trade gate, net P/L, win rate and drawdown — so trades taken
+  // under a strategy/sizing bug that's since been fixed stop permanently dragging down
+  // (or falsely propping up) a strategy's verdict. Nothing is deleted; this only changes
+  // what the scorekeeper counts going forward, and every strategy restarts its 50-trade
+  // count from zero.
+  const resetStats=async()=>{
+    if(!window.ZuShePaperDB?.updateSystemFlags)return;
+    if(!window.confirm("Reset Live Readiness stats?\n\nEvery strategy's 50-trade count, net P/L, win rate and drawdown will restart from zero, counting only trades that close from now on. Past trades are kept in Trade Journal — nothing is deleted."))return;
+    setResetting(true);
+    try{
+      await window.ZuShePaperDB.updateSystemFlags({stats_reset_at:new Date().toISOString()});
+      showToast&&showToast('Stats reset — readiness now counts only trades closing from this point on.','success');
+      await load();
+    }catch(err){
+      showToast&&showToast('Reset failed: '+(err?.message||err),'error');
+    }finally{
+      setResetting(false);
+    }
+  };
 
   useEffect(()=>{
     let cancelled=false,tries=0;
@@ -3051,6 +3144,18 @@ function LiveReadiness({showToast}){
           e('div',{style:{fontWeight:700,marginBottom:3,color:liveOn?'var(--green)':'var(--red)'}},liveOn?'Live Trading Flag: ON':'Live Trading Flag: OFF'),
           'Broker Connection is live under More — this flag and a saved, verified Luno trading key are both required before a single real trade could be placed.'
         )
+      ),
+
+      e('div',{className:'card',style:{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}},
+        e('div',null,
+          e('div',{style:{fontWeight:700,fontSize:12,marginBottom:2}},'Reset Stats'),
+          e('div',{style:{fontSize:10,color:'var(--text3)',lineHeight:1.4}},
+            flags?.stats_reset_at
+              ?('Currently counting trades closed since '+new Date(flags.stats_reset_at).toLocaleString([],{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})+'.')
+              :'Counting every trade ever closed. Use this after a strategy/sizing fix so old, since-fixed trades stop skewing the verdict.'
+          )
+        ),
+        e('button',{className:'btn btn-xs',disabled:resetting,onClick:resetStats},resetting?'Resetting…':'↺ Reset')
       ),
 
       e('div',{className:'stat-grid'},
@@ -3107,7 +3212,22 @@ function LiveReadiness({showToast}){
               e('div',{style:{fontSize:11,color:'var(--text3)',lineHeight:1.5}},
                 (sr.win_rate!=null?Math.round(sr.win_rate)+'% win rate · ':'')+
                 (sr.profit_factor!=null?'profit factor '+Number(sr.profit_factor).toFixed(2):'profit factor n/a')
-              )
+              ),
+              // Does this strategy's own confidence score actually track outcomes? If
+              // high-confidence trades aren't winning noticeably more than low-confidence
+              // ones, the score isn't earning its keep yet — worth knowing before trusting it.
+              sr.confidence_breakdown&&(sr.confidence_breakdown.high?.n||sr.confidence_breakdown.mid?.n||sr.confidence_breakdown.low?.n)&&
+                e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:6,marginTop:8,paddingTop:8,borderTop:'1px solid var(--border)',textAlign:'center'}},
+                  ['high','mid','low'].map(tier=>{
+                    const b=sr.confidence_breakdown[tier]||{n:0,net:0,winRate:null};
+                    const lbl=tier==='high'?'HIGH CONF (75+)':tier==='mid'?'MID CONF (60-74)':'LOW CONF (<60)';
+                    return e('div',{key:tier},
+                      e('div',{style:{fontSize:8,color:'var(--text3)'}},lbl),
+                      e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:11}},b.n+' trades'),
+                      e('div',{style:{fontSize:9,color:b.winRate==null?'var(--text3)':b.winRate>=50?'var(--green)':'var(--red)'}},b.winRate==null?'—':Math.round(b.winRate)+'% win')
+                    );
+                  })
+                )
             );
           }),
 
