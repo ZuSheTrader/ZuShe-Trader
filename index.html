@@ -549,57 +549,72 @@ function zsOpportunityBonus(x,confidence){
 // Runs every strategy against one set of candles and returns every setup
 // that fires — same shape and thresholds as signal-scan's evaluateAll.
 function evaluateAllPaperSignals(candles){
-  const closed=candles.length>1?candles.slice(0,-1):candles;
-  if(closed.length<205)return [];
-  const x=marketIndicators(closed);
+  if(candles.length<205)return [];
+  const x=marketIndicators(candles);
   if(![x.price,x.ema20,x.ema50,x.ema200,x.rsi,x.atr].every(Number.isFinite))return [];
-  const ev=signalEvidence(x),n=closed.length,last=closed[n-1],prevCandle=closed[n-2];
-  const prev=closed.slice(n-21,n-1);
-  const hh=Math.max(...prev.map(c=>c.high)),ll=Math.min(...prev.map(c=>c.low));
+  const ev=signalEvidence(x);
+  const n=candles.length;
+  const prev=candles.slice(n-21,n-1);
+  const hh=Math.max(...prev.map(c=>c.high));
+  const ll=Math.min(...prev.map(c=>c.low));
+
   const trendUp=x.price>x.ema200&&x.ema20>x.ema50;
   const trendDown=x.price<x.ema200&&x.ema20<x.ema50;
-  const bullish=last.close>last.open,bearish=last.close<last.open;
-  const rsiPrev=rsiSeries(closed.map(c=>c.close),14).slice(-2)[0];
-  const rsiRising=x.rsi>rsiPrev+1,rsiFalling=x.rsi<rsiPrev-1;
-  const volStrict=x.volume>=x.avgVolume*.8,volSurge=x.volume>=x.avgVolume*1.2;
-  const notExtUp=x.price<=x.ema20+1.15*x.atr,notExtDown=x.price>=x.ema20-1.15*x.atr;
+  const volLoose=x.volume>=x.avgVolume*0.5;
+  const volStrict=x.volume>=x.avgVolume*0.8;
+  const volSurge=x.volume>=x.avgVolume*1.2;
+
   const out=[];
   const add=(strategy,direction,confidence,reason,stopMult,baseRr)=>{
-    const conf=Math.min(92,Math.round(confidence)); if(conf<72)return;
-    const rr=+(baseRr*(volSurge?1.10:1)).toFixed(2);
-    out.push({strategy,direction,confidence:conf,reason:reason+(volSurge?' Volume expansion confirms participation.':''),
-      stopDistance:Math.max(x.atr*stopMult,x.price*.008),rr,price:x.price,evidence:ev,indicators:x});
+    const conf=Math.min(85,Math.round(confidence));
+    const bonus=zsOpportunityBonus(x,conf);
+    const rr=+(baseRr*(1+bonus)).toFixed(2);
+    const stretched=bonus>=0.5;
+    out.push({
+      strategy,direction,confidence:conf,
+      reason:reason+(stretched?' Target extended ('+rr+':1) on strong volume/volatility/trend confluence.':''),
+      stopDistance:Math.max(x.atr*stopMult,x.price*0.008),rr,price:x.price,evidence:ev,indicators:x
+    });
   };
-  if(trendUp&&x.rsi>=52&&x.rsi<=70&&volStrict&&bullish&&notExtUp){
-    add('Combined','BUY',72+(x.rsi>=55&&x.rsi<=66?6:0)+(volSurge?6:0)+(x.emaSpreadPct>.6?5:0)+(rsiRising?4:0),'Confirmed bullish trend, momentum and participation.',1.8,2);
-  }else if(trendDown&&x.rsi>=30&&x.rsi<=48&&volStrict&&bearish&&notExtDown){
-    add('Combined','SELL',72+(x.rsi>=34&&x.rsi<=45?6:0)+(volSurge?6:0)+(x.emaSpreadPct>.6?5:0)+(rsiFalling?4:0),'Confirmed bearish trend, momentum and participation.',1.8,2);
+
+  if(trendUp&&x.rsi>=50&&x.rsi<=75&&volLoose){
+    const strict=x.rsi>=55&&x.rsi<=72;
+    add('Combined','BUY',65+(strict?8:0)+(volStrict?5:0),'Combined trend, momentum and volume confirmation'+(strict&&volStrict?'.':' (relaxed thresholds).'),2.0,3);
+  }else if(trendDown&&x.rsi<=50&&x.rsi>=25&&volLoose){
+    const strict=x.rsi<=45&&x.rsi>=28;
+    add('Combined','SELL',65+(strict?8:0)+(volStrict?5:0),'Combined bearish trend, momentum and volume confirmation'+(strict&&volStrict?'.':' (relaxed thresholds).'),2.0,3);
   }
-  if(trendUp&&x.rsi>=52&&x.rsi<=70&&volStrict&&bullish&&notExtUp){
-    add('Trend Rider','BUY',72+(x.emaSpreadPct>.6?6:0)+(volSurge?6:0)+(rsiRising?4:0),'Established uptrend with a confirmed bullish close.',1.8,2);
-  }else if(trendDown&&x.rsi>=30&&x.rsi<=48&&volStrict&&bearish&&notExtDown){
-    add('Trend Rider','SELL',72+(x.emaSpreadPct>.6?6:0)+(volSurge?6:0)+(rsiFalling?4:0),'Established downtrend with a confirmed bearish close.',1.8,2);
+
+  if(trendUp&&volLoose){
+    add('Trend Rider','BUY',58+(x.rsi>=50&&x.rsi<=75?6:0)+(volStrict?4:0)+(x.ema20>x.ema50*1.002?4:0),'Uptrend: price above EMA200 and EMA20 above EMA50.',2.0,3);
+  }else if(trendDown&&volLoose){
+    add('Trend Rider','SELL',58+(x.rsi<=50&&x.rsi>=25?6:0)+(volStrict?4:0)+(x.ema20<x.ema50*0.998?4:0),'Downtrend: price below EMA200 and EMA20 below EMA50.',2.0,3);
   }
-  if(x.rsi>=55&&x.rsi<=70&&x.ema20>x.ema50&&x.price>x.ema20&&volStrict&&bullish&&rsiRising&&notExtUp){
-    add('Momentum','BUY',76+(volSurge?6:0)+(trendUp?5:0),'Bullish momentum confirmed by rising RSI, EMA alignment and volume.',1.5,1.8);
-  }else if(x.rsi>=30&&x.rsi<=45&&x.ema20<x.ema50&&x.price<x.ema20&&volStrict&&bearish&&rsiFalling&&notExtDown){
-    add('Momentum','SELL',76+(volSurge?6:0)+(trendDown?5:0),'Bearish momentum confirmed by falling RSI, EMA alignment and volume.',1.5,1.8);
+
+  if(x.rsi>=52&&x.rsi<=80&&x.ema20>x.ema50&&x.price>x.ema20&&volLoose){
+    add('Momentum','BUY',58+(x.rsi<=72?5:0)+(volStrict?4:0)+(trendUp?5:0),'Bullish momentum: RSI strong and price holding above EMA20.',1.6,2);
+  }else if(x.rsi<=48&&x.rsi>=20&&x.ema20<x.ema50&&x.price<x.ema20&&volLoose){
+    add('Momentum','SELL',58+(x.rsi>=28?5:0)+(volStrict?4:0)+(trendDown?5:0),'Bearish momentum: RSI weak and price staying below EMA20.',1.6,2);
   }
-  if(x.price<x.bb.lower&&x.rsi<35&&bullish&&x.price>prevCandle.close){
-    add('Mean Reversion','BUY',74+(x.rsi<30?8:0)+(volSurge?5:0),'Oversold extension with a confirmed bullish reversal candle.',1.7,1.8);
-  }else if(x.price>x.bb.upper&&x.rsi>65&&bearish&&x.price<prevCandle.close){
-    add('Mean Reversion','SELL',74+(x.rsi>70?8:0)+(volSurge?5:0),'Overbought extension with a confirmed bearish reversal candle.',1.7,1.8);
+
+  if(x.price<x.bb.lower&&x.rsi<40){
+    add('Mean Reversion','BUY',58+(x.rsi<30?8:0)+(x.price>x.ema200?4:0)+(volSurge?3:0),'Oversold: price below the lower Bollinger Band with weak RSI — bounce setup.',1.8,2);
+  }else if(x.price>x.bb.upper&&x.rsi>60){
+    add('Mean Reversion','SELL',58+(x.rsi>70?8:0)+(x.price<x.ema200?4:0)+(volSurge?3:0),'Overbought: price above the upper Bollinger Band with strong RSI — pullback setup.',1.8,2);
   }
-  if(x.price>hh&&volSurge&&bullish&&x.price-hh<=.75*x.atr){
-    add('Breakout','BUY',76+(trendUp?7:0)+(x.rsi>=55&&x.rsi<=72?5:0),'20-candle breakout with strong volume and controlled extension.',1.8,2);
-  }else if(x.price<ll&&volSurge&&bearish&&ll-x.price<=.75*x.atr){
-    add('Breakout','SELL',76+(trendDown?7:0)+(x.rsi>=28&&x.rsi<=45?5:0),'20-candle breakdown with strong volume and controlled extension.',1.8,2);
+
+  if(x.price>hh&&volLoose){
+    add('Breakout','BUY',58+(volSurge?8:0)+(trendUp?6:0)+(x.rsi<80?2:0),'Breakout: price closed above the previous 20-candle high.',2.0,3);
+  }else if(x.price<ll&&volLoose){
+    add('Breakout','SELL',58+(volSurge?8:0)+(trendDown?6:0)+(x.rsi>20?2:0),'Breakdown: price closed below the previous 20-candle low.',2.0,3);
   }
-  if(trendUp&&x.price<=x.ema20+.20*x.atr&&x.price>=x.ema50&&x.rsi>=42&&x.rsi<=56&&bullish&&x.price>prevCandle.close&&volStrict){
-    add('Pullback','BUY',74+(volSurge?6:0)+(x.rsi>=45&&x.rsi<=52?5:0),'Uptrend pullback with bullish rejection from the EMA zone.',1.5,1.9);
-  }else if(trendDown&&x.price>=x.ema20-.20*x.atr&&x.price<=x.ema50&&x.rsi>=44&&x.rsi<=58&&bearish&&x.price<prevCandle.close&&volStrict){
-    add('Pullback','SELL',74+(volSurge?6:0)+(x.rsi>=48&&x.rsi<=55?5:0),'Downtrend rally with bearish rejection from the EMA zone.',1.5,1.9);
+
+  if(trendUp&&x.price<=x.ema20+0.25*x.atr&&x.price>=x.ema50&&x.rsi>=38&&x.rsi<=58){
+    add('Pullback','BUY',62+(volStrict?4:0)+(x.rsi>=42&&x.rsi<=52?4:0),'Pullback in an uptrend: price dipped back to the EMA20/EMA50 zone.',1.6,2.5);
+  }else if(trendDown&&x.price>=x.ema20-0.25*x.atr&&x.price<=x.ema50&&x.rsi>=42&&x.rsi<=62){
+    add('Pullback','SELL',62+(volStrict?4:0)+(x.rsi>=48&&x.rsi<=58?4:0),'Rally in a downtrend: price bounced back to the EMA20/EMA50 zone.',1.6,2.5);
   }
+
   return out;
 }
 function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair){
@@ -663,7 +678,7 @@ function paperRiskAllowed(stats,account,riskSettings,candidate){
   }
   return {ok:true};
 }
-const ZS_BUILD='2026-09-27.2';
+const ZS_BUILD='2026-09-26.2';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
@@ -720,11 +735,6 @@ async function runPaperEngine(strategy='Combined',pair=PAPER_CONFIG.pair){
   const snapshot={candles,lastPrice,updatedAt:Date.now(),pair};
   paperSave(PAPER_LS.market,snapshot);
   const signal=evaluatePaperSignal(candles,strategy,pair);
-  if(signal&&signal.direction!=='NO TRADE'&&Number.isFinite(lastPrice)&&lastPrice>0){
-    const drift=Math.abs(lastPrice-Number(signal.price||lastPrice))/Math.max(1,Number(signal.price||lastPrice));
-    if(drift<=0.006) signal.price=lastPrice;
-    else { signal.direction='NO TRADE'; signal.confidence=0; signal.reason='Signal invalidated: live entry moved more than 0.6% from the completed-candle setup.'; }
-  }
   paperSave(PAPER_LS.signal,signal);
   return {candles,ticker,lastPrice,signal};
 }
@@ -783,14 +793,14 @@ const DEMO_ACCOUNT_SEED={balance:10000,equity:10000,used:0,currency:'ZAR',dailyP
 // Resolves the real baseline for % return / Total P-L math — the account's own
 // starting_balance when known (so a manual balance top-up is never counted as
 // "return"), falling back to the demo seed only if it truly isn't set yet.
-function zsStartBal(account){const v=Number(account&&account.view_starting_balance);if(Number.isFinite(v)&&v>0)return v;const n=Number(account&&account.starting_balance);return Number.isFinite(n)&&n>0?n:DEMO_ACCOUNT_SEED.balance;}
+function zsStartBal(account){const n=Number(account&&account.starting_balance);return Number.isFinite(n)&&n>0?n:DEMO_ACCOUNT_SEED.balance;}
 
 const JOURNAL_SEED=[
   {id:'j1',date:'2024-01-15',market:'XAU/USD',dir:'BUY',entry:2290.10,exit:2318.45,sl:2278,tp:2320,size:0.05,risk:100,pl:141.75,strat:'Momentum Surge',conf:81,status:'Win',notes:'Clean trend entry. Held through pullback.',tags:['trend','gold']},
   {id:'j2',date:'2024-01-12',market:'NAS100',dir:'BUY',entry:18240,exit:18150,sl:18180,tp:18400,size:0.01,risk:60,pl:-90,strat:'Breakout Hunter NAS',conf:68,status:'Loss',notes:'Stop hit on news spike. Reduce size near news events.',tags:['breakout','news']},
 ];
 
-const RISK_SETTINGS_SEED={riskPerTrade:1,maxDailyLoss:15,maxWeeklyLoss:25,maxOpenTrades:40,maxPerMarket:12,maxPerStrategy:12,maxDD:30,losingStreak:12,minConfidence:72,allowOvernight:true,allowWeekend:false,allowNews:false,requireApproval:true,liveEnabled:false};
+const RISK_SETTINGS_SEED={riskPerTrade:1,maxDailyLoss:15,maxWeeklyLoss:25,maxOpenTrades:40,maxPerMarket:12,maxPerStrategy:12,maxDD:30,losingStreak:12,minConfidence:60,allowOvernight:true,allowWeekend:false,allowNews:false,requireApproval:true,liveEnabled:false};
 
 // ═══════════════════════════════════════════
 // HELPERS
@@ -969,12 +979,10 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
     openPaper.forEach(pos=>{
       const exit=evaluatePaperExit(pos,lastPrice);
       if(!exit)return;
-      const grossPl=parseFloat(((pos.dir==='BUY'?(exit.exitPrice-pos.entry):(pos.entry-exit.exitPrice))*(pos.size||0)).toFixed(2));
-      const fee=zsRoundTripFee(pos.entry,exit.exitPrice,pos.size||0);
-      const pl=parseFloat((grossPl-fee).toFixed(2));
+      const pl=parseFloat(((pos.dir==='BUY'?(exit.exitPrice-pos.entry):(pos.entry-exit.exitPrice))*(pos.size||0)).toFixed(2));
       const newBalance=parseFloat((account.balance+pl).toFixed(2));
       const newDailyPL=parseFloat(((account.dailyPL||0)+pl).toFixed(2));
-      const trade={...pos,exit:exit.exitPrice,pl,grossPl,fee,slip:0,closeTime:new Date().toISOString(),status:pl>=0?'Win':'Loss',trigger:exit.trigger};
+      const trade={...pos,exit:exit.exitPrice,pl,closeTime:new Date().toISOString(),status:exit.status,trigger:exit.trigger};
       recordPaperTradeResult(pl);
       setAccount(a=>({...a,
         balance:newBalance,
@@ -3927,55 +3935,46 @@ function AppSettings({showToast,onLogout,account,setAccount,signals,setSignals})
       e('div',{className:'settings-section'},
         e('div',{className:'settings-hdr'},'Data Management'),
         e('div',{className:'settings-row',style:{cursor:'pointer'},
-          onClick:async()=>{
-            if(!window.confirm('RESET PAPER ACCOUNT TO R10,000\n\nThis clears the primary paper trades, paper signals and daily paper snapshots on the server.\n\nIt does NOT delete the app, strategy intelligence/learning, evolution sandbox, API keys, or real Luno orders.\n\nContinue?'))return;
-            try{
-              showToast('Resetting paper account…','info');
-              await window.ZuShePaperDB?.hardResetPaperData?.();
-              LS.del('za_soft_reset_at'); LS.del('za_soft_reset_balance');
-              LS.del('za_account'); LS.del('za_signals');
-              showToast('Paper account reset to R10,000','success');
-              setTimeout(()=>window.location.reload(),500);
-            }catch(err){ showToast('Paper reset failed: '+(err?.message||err),'error'); }
+          onClick:()=>{
+            LS.del('za_account');
+            showToast('Demo account reset to R10,000 — reload to see changes','info');
           }},
           e('div',null,
-            e('div',{className:'settings-lbl',style:{color:'var(--amber)'}},'Reset Paper Account to R10,000'),
-            e('div',{className:'settings-sub'},'Hard-resets the primary paper account on the server. Strategy intelligence and the evolution engine are kept.')
+            e('div',{className:'settings-lbl',style:{color:'var(--amber)'}},'Reset Demo Account to R10,000'),
+            e('div',{className:'settings-sub'},'Clears all open positions, closed trades, and resets balance to the starting R10,000. Your strategies and signals are kept.')
           ),
           e('span',{style:{color:'var(--amber)',fontSize:18}},'›')
         ),
-        e('div',{className:'settings-row',style:{cursor:'pointer'},
-          onClick:()=>{
-            if(window.confirm('SOFT RESET DISPLAY\n\nThis starts a fresh on-device viewing session. Old server trades, signals and strategy learning are NOT deleted.\n\nOld closed trades will stop contributing to the numbers you see in the main app, but they remain on the server and continue to be available to the learning/review system. Existing open positions remain visible for safety.\n\nContinue?')){
-              LS.set('za_soft_reset_at',Date.now());
-              LS.set('za_soft_reset_balance',Number(account?.balance)||10000);
-              LS.del('za_account'); LS.del('za_signals');
-              showToast('Soft reset applied — starting a fresh display session','success');
-              setTimeout(()=>window.location.reload(),400);
-            }
-          }},
+        e('div',{style:{padding:'10px 16px 2px',fontFamily:'var(--mono)',fontSize:9,color:'var(--text3)',letterSpacing:1.5}},'CLEAR SIGNAL HISTORY BY STATUS'),
+        e('div',{style:{padding:'0 16px 8px',fontSize:11,color:'var(--text3)',lineHeight:1.5}},'Clears the signals shown in that sub-tab of Signal Desk only. Trades and account balance are never touched. Tap once to confirm, tap again to clear.'),
+        Object.keys(clearLabels).map(key=>
+          e('div',{key:'clr-'+key,className:'settings-row',style:{cursor:'pointer'},onClick:()=>clearSignalBucket(key)},
+            e('div',null,
+              e('div',{className:'settings-lbl',style:{color:clearConfirm===key?'var(--red)':'var(--text)'}},clearLabels[key]+' ('+sigBuckets[key].length+')'),
+              e('div',{className:'settings-sub'},clearConfirm===key?'Tap again to confirm — this cannot be undone.':'Tap to clear this sub-tab\u2019s signal history.')
+            ),
+            e('span',{style:{color:'var(--amber)',fontSize:11,fontFamily:'var(--mono)'}},clearBusy===key?'Clearing…':'Clear ›')
+          )
+        ),
+        e('div',{className:'settings-row',style:{cursor:'pointer'},onClick:()=>clearSignalBucket('all')},
           e('div',null,
-            e('div',{className:'settings-lbl',style:{color:'var(--cyan)'}},'Soft Reset — Clear Displayed Trading History'),
-            e('div',{className:'settings-sub'},'Resets the visible closed-trade/session statistics without deleting server trades or learned strategy data. Existing open positions stay visible.')
+            e('div',{className:'settings-lbl',style:{color:clearConfirm==='all'?'var(--red)':'var(--amber)'}},'Clear ALL Signal History ('+sigList.length+')'),
+            e('div',{className:'settings-sub'},clearConfirm==='all'?'Tap again to confirm — this cannot be undone.':'Clears every sub-tab above at once. Trades and account balance are never touched.')
           ),
-          e('span',{style:{color:'var(--cyan)',fontSize:18}},'›')
+          e('span',{style:{color:'var(--red)',fontSize:18}},'›')
         ),
         e('div',{className:'settings-row',style:{cursor:'pointer'},
           onClick:()=>{
-            if(window.confirm('CLEAR LOCAL APP CACHE ONLY\n\nThis removes cached signal/account display data from this phone and reloads the app. It does NOT delete server trades, signals, strategy learning, API keys, or real orders.\n\nContinue?')){
-              ['za_account','za_signals'].forEach(k=>LS.del(k));
-              paperReset();
+            if(window.confirm('CLEAR ALL DATA\n\nThis will delete everything: demo account, trades, strategies, signals, and all settings.\n\nThis cannot be undone. Are you sure?')){
+              localStorage.clear();
               window.location.reload();
             }
           }},
           e('div',null,
-            e('div',{className:'settings-lbl'},'Clear Local Cache & Restart'),
-            e('div',{className:'settings-sub'},"Clears only this phone/browser's temporary paper-engine and display cache. Does not touch the server.")
+            e('div',{className:'settings-lbl',style:{color:'var(--red)'}},'Clear All App Data & Restart'),
+            e('div',{className:'settings-sub'},'Wipes all local data completely and restarts the app from scratch. Cannot be undone.')
           ),
-          e('span',{style:{color:'var(--text3)',fontSize:18}},'›')
-        ),
-        e('div',{style:{padding:'10px 14px 14px',fontSize:10,color:'var(--text3)',lineHeight:1.6}},
-          'Important: the old “Clear All App Data & Restart” used localStorage.clear(), which could remove login, risk settings, strategies and other local state but could not delete Supabase data. It has been replaced by the safer Soft Reset / Hard Reset controls above.'
+          e('span',{style:{color:'var(--red)',fontSize:18}},'›')
         )
       ),
 
@@ -4005,9 +4004,9 @@ function App(){
   const[riskSettings,setRiskSettings]=useState(()=>{
     const saved=LS.get('za_risk',RISK_SETTINGS_SEED);
     // One-time bump (v2) so an already-saved conservative setup does not block accepting many signals for paper testing.
-    if(LS.get('za_risk_v',1)<3){
-      LS.set('za_risk_v',3);
-      return {...saved,maxOpenTrades:Math.max(saved.maxOpenTrades||1,40),maxDailyLoss:Math.max(saved.maxDailyLoss||3,15),maxWeeklyLoss:Math.max(saved.maxWeeklyLoss||8,25),maxPerMarket:Math.max(saved.maxPerMarket||1,12),maxPerStrategy:Math.max(saved.maxPerStrategy||1,12),maxDD:Math.max(saved.maxDD||15,30),losingStreak:Math.max(saved.losingStreak||3,12),minConfidence:Math.max(saved.minConfidence||60,72)};
+    if(LS.get('za_risk_v',1)<2){
+      LS.set('za_risk_v',2);
+      return {...saved,maxOpenTrades:Math.max(saved.maxOpenTrades||1,40),maxDailyLoss:Math.max(saved.maxDailyLoss||3,15),maxWeeklyLoss:Math.max(saved.maxWeeklyLoss||8,25),maxPerMarket:Math.max(saved.maxPerMarket||1,12),maxPerStrategy:Math.max(saved.maxPerStrategy||1,12),maxDD:Math.max(saved.maxDD||15,30),losingStreak:Math.max(saved.losingStreak||3,12)};
     }
     return saved;
   });
@@ -4091,12 +4090,7 @@ function App(){
       }
       const balance=Number(remote.balance);
       if(!Number.isFinite(balance))return;
-      const viewResetAt=Number(LS.get('za_soft_reset_at',0))||0;
-      const viewBaseline=Number(LS.get('za_soft_reset_balance',0));
-      const displayClosedRows=viewResetAt
-        ? closedRows.filter(t=>Date.parse(t.exit_time||t.entry_time||0)>=viewResetAt)
-        : closedRows;
-      const daily=parseFloat(displayClosedRows.filter(t=>t.exit_time&&tz(t.exit_time)===today).reduce((s,t)=>s+(Number(t.net_pnl)||0),0).toFixed(2));
+      const daily=parseFloat(closedAll.filter(t=>t.exit_time&&tz(t.exit_time)===today).reduce((s,t)=>s+(Number(t.net_pnl)||0),0).toFixed(2));
       // local positions that closed on the server since we last looked -> feed the local risk stats
       const openIds=new Set(openRows.map(t=>t.id));
       const closedById={};closedRows.forEach(t=>{closedById[t.id]=t;});
@@ -4117,10 +4111,9 @@ function App(){
         const openPositions=[...serverOpen,...keepLocal];
         const serverClosedIds=new Set(closedAll.map(t=>t.id));
         const localClosedKept=(a.closedTrades||[]).filter(t=>t.status!=='Void'&&!(t.dbId&&(serverClosedIds.has(t.dbId)||voidedIds.has(t.dbId)))&&!(t.paper&&Math.abs(Number(t.pl)||0)>50000));
-        const closedTrades=[...displayClosedRows.map(zsRowToClosed),...localClosedKept].sort((x,y)=>new Date(y.closeTime||0)-new Date(x.closeTime||0));
+        const closedTrades=[...closedRows.map(zsRowToClosed),...localClosedKept].sort((x,y)=>new Date(y.closeTime||0)-new Date(x.closeTime||0));
         return {...a,balance,equity:balance,dailyPL:daily,openPositions,closedTrades,
           starting_balance:Number(remote.starting_balance)||zsStartBal(a),
-          view_starting_balance:viewResetAt&&Number.isFinite(viewBaseline)&&viewBaseline>0?viewBaseline:undefined,
           used:parseFloat(openPositions.reduce((s,p)=>s+(Number(p.risk)||0),0).toFixed(2))};
       });
     }catch(err){ console.warn('[ZuShé Trader] Could not sync Supabase paper account:',err?.message||err); }
@@ -4148,9 +4141,7 @@ function App(){
     setSignalsLoading(true);
     try{
       const rows=await window.ZuShePaperDB.loadSignals();
-      const signalResetAt=Number(LS.get('za_soft_reset_at',0))||0;
-      const displayRows=signalResetAt?rows.filter(r=>Date.parse(r.created_at||0)>=signalResetAt):rows;
-      setSignals(displayRows.map(r=>mapDbSignalToUi(r,account,riskSettings)));
+      setSignals(rows.map(r=>mapDbSignalToUi(r,account,riskSettings)));
     }catch(err){
       console.warn('[ZuShé Trader] Could not load signals:',err?.message||err);
     }finally{setSignalsLoading(false);}
@@ -4632,38 +4623,6 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     return { deleted: ids.length };
   }
 
-  // Hard-reset ONLY the primary paper-trading data on the server. This deliberately
-  // preserves the evolution sandbox, strategy pool/learning, market candles,
-  // API keys/secrets, notification subscriptions, and the app's code/configuration.
-  // It clears the user's primary paper trades/signals/daily snapshots and returns
-  // the primary paper account to R10,000. No real Luno orders are touched.
-  async function zsHardResetPaperData() {
-    const db = zsInitSupabase();
-    if (!db) throw new Error('Supabase not available');
-    const account = zsAccount || await zsEnsureAccount();
-    if (!account?.id) throw new Error('Primary paper account not available');
-
-    const accountId = account.id;
-    const deletes = [
-      ['trader_paper_trades','account_id'],
-      ['trader_signals','account_id'],
-      ['trader_daily_performance','account_id']
-    ];
-    for (const [table,col] of deletes) {
-      const { error } = await db.from(table).delete().eq(col, accountId);
-      if (error) throw new Error(table+' reset failed: '+(error.message||error));
-    }
-
-    const { data, error } = await db.from('trader_paper_accounts').update({
-      starting_balance:10000, balance:10000, equity:10000, realized_pnl:0, daily_pnl:0,
-      consecutive_losses:0, circuit_breaker:false, last_risk_alert_at:null,
-      updated_at:new Date().toISOString()
-    }).eq('id',accountId).select().single();
-    if (error) throw error;
-    zsAccount=data;
-    return {ok:true,account:data};
-  }
-
   // Telegram screenshot -> signal. The edge function reads the image with
   // vision, extracts the trade call and inserts it into trader_signals with
   // source:'telegram'. Needs the ANTHROPIC_API_KEY secret on the project.
@@ -4852,7 +4811,6 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     loadSignals: zsLoadSignals,
     decideSignal: zsDecideSignal,
     deleteSignals: zsDeleteSignals,
-    hardResetPaperData: zsHardResetPaperData,
     submitTelegramSignal: zsSubmitTelegramSignal,
     getSecretStatus: zsGetSecretStatus,
     saveSecret: zsSaveSecret,
