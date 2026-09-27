@@ -672,6 +672,53 @@ function zsH4Regime(h4CandlesIn){
   if(![hx.price,hx.ema20,hx.ema50,hx.ema200].every(Number.isFinite))return 'NEUTRAL';
   return hx.price>hx.ema200&&hx.ema20>hx.ema50?'UP':(hx.price<hx.ema200&&hx.ema20<hx.ema50?'DOWN':'NEUTRAL');
 }
+// Mirrors the server signal-scan gateStatus() EXACTLY (same thresholds, same
+// tiers) so a strategy+pair+timeframe+direction combo the scanner has already
+// quarantined from bad real history can't be reopened just by tapping the
+// interactive card's manual "Open Paper Trade" button — that button used to
+// be the one path into the account that never checked this history at all.
+function zsGateStatus(st){
+  if(!st||st.n<10)return {blocked:false,tier:'experimental'};
+  const winRate=st.wins/st.n;
+  const expectancy=st.net/st.n;
+  const pf=st.grossLoss>0?st.grossProfit/st.grossLoss:(st.grossProfit>0?99:0);
+  if(st.trailingLossStreak>=5)return {blocked:true,tier:'quarantine',reason:st.trailingLossStreak+'-loss streak (quarantined until a win breaks it)'};
+  if(st.trailingLossStreak>=3)return {blocked:true,tier:'cooldown',reason:st.trailingLossStreak+'-loss streak (cooldown until a win breaks it)'};
+  if(st.n>=10&&winRate<0.40&&(pf<0.7||expectancy<-30))return {blocked:true,tier:'quarantine',reason:st.n+' trades, '+(winRate*100).toFixed(0)+'% win rate, PF '+pf.toFixed(2)+', R'+expectancy.toFixed(0)+'/trade expectancy'};
+  if(st.n>=20&&expectancy>0&&pf>=1)return {blocked:false,tier:'eligible'};
+  return {blocked:false,tier:st.n<20?'monitor':'eligible'};
+}
+// Same aggregation the server runs over trader_paper_trades: AUTO (TP/SL)
+// closes only — manual closes are tracked separately and never feed the
+// verdict — walked oldest-to-newest so trailingLossStreak means what it says.
+function zsComputeComboStats(trades){
+  const stats={};
+  for(const t of trades){
+    const auto=!String(t.exit_reason||'').startsWith('Manual');
+    if(!auto)continue;
+    const k=[t.strategy,t.pair,t.timeframe,t.direction].join('|');
+    const s=stats[k]||(stats[k]={n:0,wins:0,net:0,grossProfit:0,grossLoss:0,trailingLossStreak:0});
+    const pnl=Number(t.net_pnl)||0;
+    s.n++; s.net+=pnl;
+    if(pnl>0){s.wins++;s.grossProfit+=pnl;s.trailingLossStreak=0;}
+    else{s.grossLoss+=Math.abs(pnl);s.trailingLossStreak++;}
+  }
+  return stats;
+}
+// Best-effort, like zsGetEvoOverridesSafe below — a lookup failure (offline,
+// RLS hiccup) never blocks a trade on its own; it just means this particular
+// safety net didn't get to run this time, same fallback philosophy as the
+// evolution-override fetch.
+async function zsGetComboGateSafe(strategy,pair,timeframe,direction){
+  try{
+    const trades=await window.ZuShePaperDB?.loadClosedTradesForGate?.();
+    const stats=zsComputeComboStats(trades||[]);
+    const key=[strategy,pair,timeframe,direction].join('|');
+    return zsGateStatus(stats[key]);
+  }catch(_e){
+    return {blocked:false,tier:'unknown'};
+  }
+}
 function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair,evoOverrides,regime){
   if(candles.length<205)return {direction:'NO TRADE',confidence:0,reason:'Not enough historical candles yet.',evidence:[],pair,strategy};
   const sigs=zsFilterByRegime(evaluateAllPaperSignals(candles,evoOverrides),regime);
@@ -1115,11 +1162,19 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
     }catch(err){ /* non-critical — leave last known value in place */ }
   };
 
-  const paperTrade=()=>{
+  const paperTrade=async()=>{
     const stats=paperLoad(PAPER_LS.stats,{dailyLoss:0,lossStreak:0,totalPnL:0});
     const gate=paperRiskAllowed(stats,account,riskSettings,{pair:signal.pair,strategy:signal.strategy});
     if(!gate.ok){showToast(gate.reason,'error');return}
     if(signal.direction==='NO TRADE'){showToast('No trade: the strategy has not produced a valid setup.','info');return}
+    // Same combo-history quarantine signal-scan already enforces server-side —
+    // closes the gap where this manual button was the one path into the
+    // account that never checked it (see zsGetComboGateSafe).
+    const comboGate=await zsGetComboGateSafe(signal.strategy,signal.pair,PAPER_CONFIG.timeframe,signal.direction);
+    if(comboGate.blocked){
+      showToast(signal.strategy+' on '+signal.pair+' is '+comboGate.tier+' — '+comboGate.reason,'error');
+      return;
+    }
     const pos=createPaperPosition(signal,account.balance,riskSettings);
     if(!pos){showToast('Could not create paper position.','error');return}
     setAccount({...account,openPositions:[...(account.openPositions||[]),pos],used:(account.used||0)+pos.risk});
@@ -4668,6 +4723,25 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     return data || [];
   }
 
+  // Feeds zsGetComboGateSafe (the client-side mirror of signal-scan's combo
+  // quarantine gate). Oldest-first and CLOSED-only, same shape signal-scan
+  // reads server-side, so zsComputeComboStats produces the identical verdict
+  // whether it runs here or in that edge function.
+  async function zsLoadClosedTradesForGate(limit = 5000) {
+    const db = zsInitSupabase();
+    if (!db) return [];
+    const account = zsAccount || await zsEnsureAccount();
+    const { data, error } = await db
+      .from('trader_paper_trades')
+      .select('strategy,pair,timeframe,direction,net_pnl,exit_reason,status,exit_time')
+      .eq('account_id', account.id)
+      .eq('status', 'CLOSED')
+      .order('exit_time', { ascending: true })
+      .limit(limit);
+    if (error) throw error;
+    return data || [];
+  }
+
   // ── Evolution Engine (the REAL one, running server-side) ─────────────
   // This is a separate R10,000 sandbox account the autonomous evolution-
   // engine edge function trades on its own, entirely independent of the
@@ -5138,6 +5212,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     saveCandles: zsSaveCandles,
     saveSignal: zsSaveSignal,
     loadTrades: zsLoadTrades,
+    loadClosedTradesForGate: zsLoadClosedTradesForGate,
     openTrade: zsOpenTrade,
     closeTrade: zsCloseTrade,
     loadSignals: zsLoadSignals,
