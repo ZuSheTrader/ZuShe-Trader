@@ -705,6 +705,36 @@ function zsComputeComboStats(trades){
   }
   return stats;
 }
+// Mirrors signal-scan's strategyGateStatus() EXACTLY — the tripwire for a bad
+// strategy whose losses are spread thin across many pairs/timeframes/
+// directions, where no single combo ever reaches zsGateStatus's own n>=10
+// threshold on its own. Only meaningful once a strategy has real breadth
+// (n>=20 across every combo combined).
+function zsStrategyGateStatus(st){
+  if(!st||st.n<20)return {blocked:false,tier:'experimental'};
+  const winRate=st.wins/st.n;
+  const expectancy=st.net/st.n;
+  const pf=st.grossLoss>0?st.grossProfit/st.grossLoss:(st.grossProfit>0?99:0);
+  if(winRate<0.40&&(pf<0.7||expectancy<-20)){
+    return {blocked:true,tier:'quarantine',reason:'strategy-wide: '+st.n+' trades across combos, '+(winRate*100).toFixed(0)+'% win rate, PF '+pf.toFixed(2)+', R'+expectancy.toFixed(0)+'/trade expectancy (no single combo hit the per-combo gate on its own)'};
+  }
+  return {blocked:false,tier:'monitor'};
+}
+// Same aggregation as zsComputeComboStats, but rolled up per strategy across
+// every pair/timeframe/direction — feeds zsStrategyGateStatus above.
+function zsComputeStrategyStats(trades){
+  const stats={};
+  for(const t of trades){
+    const auto=!String(t.exit_reason||'').startsWith('Manual');
+    if(!auto)continue;
+    const s=stats[t.strategy]||(stats[t.strategy]={n:0,wins:0,net:0,grossProfit:0,grossLoss:0});
+    const pnl=Number(t.net_pnl)||0;
+    s.n++; s.net+=pnl;
+    if(pnl>0){s.wins++;s.grossProfit+=pnl;}
+    else{s.grossLoss+=Math.abs(pnl);}
+  }
+  return stats;
+}
 // Best-effort, like zsGetEvoOverridesSafe below — a lookup failure (offline,
 // RLS hiccup) never blocks a trade on its own; it just means this particular
 // safety net didn't get to run this time, same fallback philosophy as the
@@ -712,9 +742,19 @@ function zsComputeComboStats(trades){
 async function zsGetComboGateSafe(strategy,pair,timeframe,direction){
   try{
     const trades=await window.ZuShePaperDB?.loadClosedTradesForGate?.();
-    const stats=zsComputeComboStats(trades||[]);
+    const comboStats=zsComputeComboStats(trades||[]);
     const key=[strategy,pair,timeframe,direction].join('|');
-    return zsGateStatus(stats[key]);
+    const gate=zsGateStatus(comboStats[key]);
+    if(gate.blocked)return gate;
+    // Combo hasn't proven itself bad or good on its own — check whether the
+    // strategy overall is bleeding thin across many combos (see
+    // zsStrategyGateStatus). A combo already 'eligible' skips this entirely.
+    if(gate.tier==='experimental'||gate.tier==='monitor'){
+      const strategyStats=zsComputeStrategyStats(trades||[]);
+      const sGate=zsStrategyGateStatus(strategyStats[strategy]);
+      if(sGate.blocked)return sGate;
+    }
+    return gate;
   }catch(_e){
     return {blocked:false,tier:'unknown'};
   }
