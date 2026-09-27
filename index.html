@@ -1779,23 +1779,51 @@ function EvolutionLab({showToast}){
   const[evoLivePrice,setEvoLivePrice]=useState(null);
   const[running,setRunning]=useState(false);
   const[runResult,setRunResult]=useState(null);
+  const[evoFlags,setEvoFlags]=useState(null);
+  const[resettingEvo,setResettingEvo]=useState(false);
 
   const loadReal=useCallback(async()=>{
     if(!window.ZuShePaperDB)return;
     setPoolLoading(true);
     try{
-      const[p,a,t]=await Promise.all([
+      const[p,a,t,fl]=await Promise.all([
         window.ZuShePaperDB.loadStrategyPool(),
         window.ZuShePaperDB.loadEvolutionAccount(),
-        window.ZuShePaperDB.loadEvolutionTrades()
+        window.ZuShePaperDB.loadEvolutionTrades(),
+        window.ZuShePaperDB.getSystemFlags().catch(()=>null)
       ]);
-      setPool(p||[]); setEvoAccount(a||null); setEvoTrades(t||[]);
+      setPool(p||[]); setEvoAccount(a||null); setEvoTrades(t||[]); setEvoFlags(fl||null);
     }catch(err){
       console.warn('[ZuShé Trader] could not load evolution data:',err);
     }finally{
       setPoolLoading(false);
     }
   },[]);
+
+  // Sets trader_system_flags.evolution_stats_reset_at — the evolution-engine
+  // edge function (v12+) already reads this cutover and recomputes every
+  // genome's trades_closed/wins/losses/net_pnl/win_rate/avg_rr/score using
+  // only trades that CLOSED at/after this moment. Nothing is deleted: past
+  // trades stay in trader_paper_trades forever, and a genome's evolved
+  // params/lineage (mode, thresholds, parent, generation) are untouched —
+  // only which trades count toward its next fitness score changes. So old
+  // trades taken under the previous, since-fixed engine logic stop dragging
+  // a genome's score down, while whatever it bred/mutated into by surviving
+  // those losses is kept.
+  const resetEvoStats=async()=>{
+    if(!window.ZuShePaperDB?.updateSystemFlags)return;
+    if(!window.confirm("Reset Evolution stats?\n\nEvery genome's win rate, net P/L and fitness score will recount from zero, using only trades that close from now on. Nothing is deleted — old trades stay in the database, and each genome keeps whatever it already evolved/learned (its params, lineage, generation). Figures update after the next evolution cycle runs."))return;
+    setResettingEvo(true);
+    try{
+      await window.ZuShePaperDB.updateSystemFlags({evolution_stats_reset_at:new Date().toISOString()});
+      showToast('Evolution stats reset — scores now count only trades closing from this point on.','success');
+      await loadReal();
+    }catch(err){
+      showToast('Reset failed: '+(err?.message||err),'error');
+    }finally{
+      setResettingEvo(false);
+    }
+  };
 
   useEffect(()=>{
     let cancelled=false,tries=0;
@@ -1908,6 +1936,18 @@ function EvolutionLab({showToast}){
               evoUnrealized!==0&&e('div',{style:{fontSize:10,color:evoUnrealized>=0?'var(--green)':'var(--red)',marginTop:1}},(evoUnrealized>=0?'+':'')+fmtCur(evoUnrealized)+' unrealized')
             )
           )
+        ),
+
+        e('div',{className:'card',style:{marginBottom:14,display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}},
+          e('div',null,
+            e('div',{style:{fontWeight:700,fontSize:12,marginBottom:2}},'Reset Evolution Stats'),
+            e('div',{style:{fontSize:10,color:'var(--text3)',lineHeight:1.4}},
+              evoFlags?.evolution_stats_reset_at
+                ?('Currently scoring genomes only on trades closed since '+new Date(evoFlags.evolution_stats_reset_at).toLocaleString([],{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})+'. Nothing deleted — old trades are still in the database.')
+                :'Scoring every trade ever closed by each genome. Use this after fixing a flawed strategy so old, since-fixed losses stop dragging the score down — each genome keeps what it already learned.'
+            )
+          ),
+          e('button',{className:'btn btn-xs',disabled:resettingEvo,onClick:resetEvoStats},resettingEvo?'Resetting…':'↺ Reset')
         ),
 
         poolLoading&&pool.length===0
