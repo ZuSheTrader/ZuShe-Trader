@@ -542,94 +542,141 @@ function zsSignalConfidence(base,factors){
 // this card only ever ran a 4-strategy, fixed-2:1-RR "Combined" formula that
 // had drifted from the server; this closes that gap.
 const PAPER_STRATEGIES=['Combined','Trend Rider','Momentum','Mean Reversion','Breakout','Pullback'];
-// How much better than average this specific setup looks, based only on
-// things measurable right now (never a prediction of direction, only of "how
-// much room does this move plausibly have"). Mirrors signal-scan exactly.
-function zsOpportunityBonus(x,confidence){
-  const volSurge=x.volume>=x.avgVolume*1.2;
-  let b=0;
-  if(volSurge)b+=0.35;
-  if(x.atrRatio>1.15)b+=0.30;
-  if(x.emaSpreadPct>0.6)b+=0.25;
-  if(confidence>=75)b+=0.25;
-  return Math.min(b,1.2);
-}
-// Runs every strategy against one set of candles and returns every setup
-// that fires — same shape and thresholds as signal-scan's evaluateAll.
-function evaluateAllPaperSignals(candles){
+// Maps each strategy to the evolution engine's genome "mode" family — mirrors
+// STRATEGY_MODE in the signal-scan edge function exactly, so a genome that has
+// PROVEN a better rr/stop in real trading (see zsLoadEvoOverrides) reaches the
+// interactive Paper Engine card too, not just the server-generated signals.
+const ZS_STRATEGY_MODE={'Combined':'combined','Trend Rider':'trend','Momentum':'momentum','Mean Reversion':'mean_reversion'};
+// Runs every strategy against one set of candles and returns every setup that
+// fires. v9 — rewritten for EXACT parity with the signal-scan edge function's
+// evaluateAll (v8): only the last COMPLETED candle is evaluated (not the still
+// -forming one), each setup requires a confirming bullish/bearish close, the
+// volume floor is 0.8x average (not the old 0.5x "relaxed thresholds" path),
+// entries that have already run too far past EMA20 are rejected instead of
+// chased, RSI must be rising/falling in the trade's direction where the
+// server requires it, and confidence/reward:risk use the same formula and 92
+// cap. Previously this card ran an older, looser 4-signal formula that had
+// drifted from the server, so the same market conditions could read as a
+// signal here but not on the Signal Desk (or vice versa) — this closes that
+// gap so both are, genuinely, one evaluator.
+function evaluateAllPaperSignals(candlesIn,evoOverrides){
+  evoOverrides=evoOverrides||{};
+  const candles=candlesIn.length>1?candlesIn.slice(0,-1):candlesIn;
   if(candles.length<205)return [];
   const x=marketIndicators(candles);
   if(![x.price,x.ema20,x.ema50,x.ema200,x.rsi,x.atr].every(Number.isFinite))return [];
   const ev=signalEvidence(x);
   const n=candles.length;
+  const last=candles[n-1];
+  const prevCandle=candles[n-2];
   const prev=candles.slice(n-21,n-1);
   const hh=Math.max(...prev.map(c=>c.high));
   const ll=Math.min(...prev.map(c=>c.low));
 
   const trendUp=x.price>x.ema200&&x.ema20>x.ema50;
   const trendDown=x.price<x.ema200&&x.ema20<x.ema50;
-  const volLoose=x.volume>=x.avgVolume*0.5;
+  const bullishCandle=last.close>last.open;
+  const bearishCandle=last.close<last.open;
+  const rsiPrev=rsiSeries(candles.map(c=>c.close),14).slice(-2)[0];
+  const rsiRising=x.rsi>rsiPrev+1.0;
+  const rsiFalling=x.rsi<rsiPrev-1.0;
   const volStrict=x.volume>=x.avgVolume*0.8;
   const volSurge=x.volume>=x.avgVolume*1.2;
+  const notOverextendedUp=x.price<=x.ema20+1.15*x.atr;
+  const notOverextendedDown=x.price>=x.ema20-1.15*x.atr;
 
   const out=[];
   const add=(strategy,direction,confidence,reason,stopMult,baseRr)=>{
-    const conf=Math.min(85,Math.round(confidence));
-    const bonus=zsOpportunityBonus(x,conf);
-    const rr=+(baseRr*(1+bonus)).toFixed(2);
-    const stretched=bonus>=0.5;
+    let conf=Math.min(92,Math.round(confidence));
+    if(conf<72)return;
+    // Evolution feedback: blend a proven genome's rr/stop into this
+    // strategy's own numbers (50/50) rather than replacing them outright —
+    // mirrors the server exactly, including that a thin/losing genome (< 20
+    // real closed trades, or net non-profitable) never reaches this at all.
+    const evoMode=ZS_STRATEGY_MODE[strategy];
+    const evo=evoMode?evoOverrides[evoMode]:undefined;
+    const effStopMult=evo?(stopMult*0.5+evo.stopMult*0.5):stopMult;
+    const effBaseRr=evo?(baseRr*0.5+evo.rr*0.5):baseRr;
+    const confBonus=zsClamp((conf-72)/20,0,1)*0.25;
+    const rr=+(effBaseRr*(1+confBonus)*(volSurge?1.10:1.0)).toFixed(2);
     out.push({
       strategy,direction,confidence:conf,
-      reason:reason+(stretched?' Target extended ('+rr+':1) on strong volume/volatility/trend confluence.':''),
-      stopDistance:Math.max(x.atr*stopMult,x.price*0.008),rr,price:x.price,evidence:ev,indicators:x
+      reason:reason+(volSurge?' Volume expansion confirms participation.':'')
+        +(evo?' Target/stop tuned using '+evo.genome+' ('+evo.trades+' real trades, '+(evo.net>=0?'+':'')+'R'+evo.net.toFixed(0)+' net).':''),
+      stopDistance:Math.max(x.atr*effStopMult,x.price*0.008),
+      rr,price:x.price,evidence:ev,indicators:x
     });
   };
 
-  if(trendUp&&x.rsi>=50&&x.rsi<=75&&volLoose){
-    const strict=x.rsi>=55&&x.rsi<=72;
-    add('Combined','BUY',65+(strict?8:0)+(volStrict?5:0),'Combined trend, momentum and volume confirmation'+(strict&&volStrict?'.':' (relaxed thresholds).'),2.0,3);
-  }else if(trendDown&&x.rsi<=50&&x.rsi>=25&&volLoose){
-    const strict=x.rsi<=45&&x.rsi>=28;
-    add('Combined','SELL',65+(strict?8:0)+(volStrict?5:0),'Combined bearish trend, momentum and volume confirmation'+(strict&&volStrict?'.':' (relaxed thresholds).'),2.0,3);
+  if(trendUp&&x.rsi>=52&&x.rsi<=70&&volStrict&&bullishCandle&&notOverextendedUp){
+    const score=72+(x.rsi>=55&&x.rsi<=66?6:0)+(x.volume>=x.avgVolume*1.2?6:0)+(x.emaSpreadPct>0.6?5:0)+(rsiRising?4:0);
+    add('Combined','BUY',score,'Confirmed bullish trend, momentum and participation.',1.8,2.0);
+  }else if(trendDown&&x.rsi>=30&&x.rsi<=48&&volStrict&&bearishCandle&&notOverextendedDown){
+    const score=72+(x.rsi>=34&&x.rsi<=45?6:0)+(x.volume>=x.avgVolume*1.2?6:0)+(x.emaSpreadPct>0.6?5:0)+(rsiFalling?4:0);
+    add('Combined','SELL',score,'Confirmed bearish trend, momentum and participation.',1.8,2.0);
   }
 
-  if(trendUp&&volLoose){
-    add('Trend Rider','BUY',58+(x.rsi>=50&&x.rsi<=75?6:0)+(volStrict?4:0)+(x.ema20>x.ema50*1.002?4:0),'Uptrend: price above EMA200 and EMA20 above EMA50.',2.0,3);
-  }else if(trendDown&&volLoose){
-    add('Trend Rider','SELL',58+(x.rsi<=50&&x.rsi>=25?6:0)+(volStrict?4:0)+(x.ema20<x.ema50*0.998?4:0),'Downtrend: price below EMA200 and EMA20 below EMA50.',2.0,3);
+  if(trendUp&&x.rsi>=52&&x.rsi<=70&&volStrict&&bullishCandle&&notOverextendedUp){
+    const score=72+(x.emaSpreadPct>0.6?6:0)+(volSurge?6:0)+(rsiRising?4:0);
+    add('Trend Rider','BUY',score,'Established uptrend with a confirmed bullish close.',1.8,2.0);
+  }else if(trendDown&&x.rsi>=30&&x.rsi<=48&&volStrict&&bearishCandle&&notOverextendedDown){
+    const score=72+(x.emaSpreadPct>0.6?6:0)+(volSurge?6:0)+(rsiFalling?4:0);
+    add('Trend Rider','SELL',score,'Established downtrend with a confirmed bearish close.',1.8,2.0);
   }
 
-  if(x.rsi>=52&&x.rsi<=80&&x.ema20>x.ema50&&x.price>x.ema20&&volLoose){
-    add('Momentum','BUY',58+(x.rsi<=72?5:0)+(volStrict?4:0)+(trendUp?5:0),'Bullish momentum: RSI strong and price holding above EMA20.',1.6,2);
-  }else if(x.rsi<=48&&x.rsi>=20&&x.ema20<x.ema50&&x.price<x.ema20&&volLoose){
-    add('Momentum','SELL',58+(x.rsi>=28?5:0)+(volStrict?4:0)+(trendDown?5:0),'Bearish momentum: RSI weak and price staying below EMA20.',1.6,2);
+  if(x.rsi>=55&&x.rsi<=70&&x.ema20>x.ema50&&x.price>x.ema20&&volStrict&&bullishCandle&&rsiRising&&notOverextendedUp){
+    add('Momentum','BUY',76+(volSurge?6:0)+(trendUp?5:0),'Bullish momentum confirmed by rising RSI, EMA alignment and volume.',1.5,1.8);
+  }else if(x.rsi>=30&&x.rsi<=45&&x.ema20<x.ema50&&x.price<x.ema20&&volStrict&&bearishCandle&&rsiFalling&&notOverextendedDown){
+    add('Momentum','SELL',76+(volSurge?6:0)+(trendDown?5:0),'Bearish momentum confirmed by falling RSI, EMA alignment and volume.',1.5,1.8);
   }
 
-  if(x.price<x.bb.lower&&x.rsi<40){
-    add('Mean Reversion','BUY',58+(x.rsi<30?8:0)+(x.price>x.ema200?4:0)+(volSurge?3:0),'Oversold: price below the lower Bollinger Band with weak RSI — bounce setup.',1.8,2);
-  }else if(x.price>x.bb.upper&&x.rsi>60){
-    add('Mean Reversion','SELL',58+(x.rsi>70?8:0)+(x.price<x.ema200?4:0)+(volSurge?3:0),'Overbought: price above the upper Bollinger Band with strong RSI — pullback setup.',1.8,2);
+  // Mean reversion is the only family currently showing a positive aggregate
+  // result in the live paper history, so preserve it but keep the reversal
+  // confirmation strict rather than blindly increasing its frequency.
+  if(x.price<x.bb.lower&&x.rsi<35&&bullishCandle&&x.price>prevCandle.close){
+    add('Mean Reversion','BUY',74+(x.rsi<30?8:0)+(volSurge?5:0),'Oversold extension with a confirmed bullish reversal candle.',1.7,1.8);
+  }else if(x.price>x.bb.upper&&x.rsi>65&&bearishCandle&&x.price<prevCandle.close){
+    add('Mean Reversion','SELL',74+(x.rsi>70?8:0)+(volSurge?5:0),'Overbought extension with a confirmed bearish reversal candle.',1.7,1.8);
   }
 
-  if(x.price>hh&&volLoose){
-    add('Breakout','BUY',58+(volSurge?8:0)+(trendUp?6:0)+(x.rsi<80?2:0),'Breakout: price closed above the previous 20-candle high.',2.0,3);
-  }else if(x.price<ll&&volLoose){
-    add('Breakout','SELL',58+(volSurge?8:0)+(trendDown?6:0)+(x.rsi>20?2:0),'Breakdown: price closed below the previous 20-candle low.',2.0,3);
+  // Breakouts need participation — a breakout on ordinary volume was one of
+  // the easiest ways for the old engine to buy a move that immediately faded.
+  if(x.price>hh&&volSurge&&bullishCandle&&x.price-hh<=0.75*x.atr){
+    add('Breakout','BUY',76+(trendUp?7:0)+(x.rsi>=55&&x.rsi<=72?5:0),'20-candle breakout with strong volume and controlled extension.',1.8,2.0);
+  }else if(x.price<ll&&volSurge&&bearishCandle&&ll-x.price<=0.75*x.atr){
+    add('Breakout','SELL',76+(trendDown?7:0)+(x.rsi>=28&&x.rsi<=45?5:0),'20-candle breakdown with strong volume and controlled extension.',1.8,2.0);
   }
 
-  if(trendUp&&x.price<=x.ema20+0.25*x.atr&&x.price>=x.ema50&&x.rsi>=38&&x.rsi<=58){
-    add('Pullback','BUY',62+(volStrict?4:0)+(x.rsi>=42&&x.rsi<=52?4:0),'Pullback in an uptrend: price dipped back to the EMA20/EMA50 zone.',1.6,2.5);
-  }else if(trendDown&&x.price>=x.ema20-0.25*x.atr&&x.price<=x.ema50&&x.rsi>=42&&x.rsi<=62){
-    add('Pullback','SELL',62+(volStrict?4:0)+(x.rsi>=48&&x.rsi<=58?4:0),'Rally in a downtrend: price bounced back to the EMA20/EMA50 zone.',1.6,2.5);
+  if(trendUp&&x.price<=x.ema20+0.20*x.atr&&x.price>=x.ema50&&x.rsi>=42&&x.rsi<=56&&bullishCandle&&x.price>prevCandle.close&&volStrict){
+    add('Pullback','BUY',74+(volSurge?6:0)+(x.rsi>=45&&x.rsi<=52?5:0),'Uptrend pullback with bullish rejection from the EMA zone.',1.5,1.9);
+  }else if(trendDown&&x.price>=x.ema20-0.20*x.atr&&x.price<=x.ema50&&x.rsi>=44&&x.rsi<=58&&bearishCandle&&x.price<prevCandle.close&&volStrict){
+    add('Pullback','SELL',74+(volSurge?6:0)+(x.rsi>=48&&x.rsi<=55?5:0),'Downtrend rally with bearish rejection from the EMA zone.',1.5,1.9);
   }
 
   return out;
 }
-function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair){
+// regime: 'UP'/'DOWN'/'NEUTRAL' from the H4 chart (see zsH4Regime). Mirrors
+// the server's post-evaluateAll filter exactly: Mean Reversion is explicitly
+// allowed to counter-trend, everything else must agree with the higher
+// timeframe (or the H4 regime is NEUTRAL, in which case nothing is filtered).
+function zsFilterByRegime(sigs,regime){
+  if(!regime||regime==='NEUTRAL')return sigs;
+  return sigs.filter(s=>s.strategy==='Mean Reversion'||(s.direction==='BUY'&&regime==='UP')||(s.direction==='SELL'&&regime==='DOWN'));
+}
+// Computes the H4 trend regime from H4 candles the same way the server does,
+// so the card's/scanner's trend-following signals can be gated by it too.
+function zsH4Regime(h4CandlesIn){
+  const closed=h4CandlesIn&&h4CandlesIn.length>1?h4CandlesIn.slice(0,-1):(h4CandlesIn||[]);
+  if(closed.length<205)return 'NEUTRAL';
+  const hx=marketIndicators(closed);
+  if(![hx.price,hx.ema20,hx.ema50,hx.ema200].every(Number.isFinite))return 'NEUTRAL';
+  return hx.price>hx.ema200&&hx.ema20>hx.ema50?'UP':(hx.price<hx.ema200&&hx.ema20<hx.ema50?'DOWN':'NEUTRAL');
+}
+function evaluatePaperSignal(candles,strategy='Combined',pair=PAPER_CONFIG.pair,evoOverrides,regime){
   if(candles.length<205)return {direction:'NO TRADE',confidence:0,reason:'Not enough historical candles yet.',evidence:[],pair,strategy};
-  const sigs=evaluateAllPaperSignals(candles);
+  const sigs=zsFilterByRegime(evaluateAllPaperSignals(candles,evoOverrides),regime);
   const match=sigs.find(s=>s.strategy===strategy);
-  if(!match)return {direction:'NO TRADE',confidence:0,reason:'Conditions are not aligned for '+strategy+'.',evidence:[],pair,strategy,price:sigs[0]?.price};
+  if(!match)return {direction:'NO TRADE',confidence:0,reason:'Conditions are not aligned for '+strategy+' (or filtered out by the H4 regime).',evidence:[],pair,strategy,price:sigs[0]?.price};
   return {...match,pair,timestamp:Date.now()};
 }
 // Cape Town-local calendar day, used so "daily" loss/streak tracking actually
@@ -686,7 +733,7 @@ function paperRiskAllowed(stats,account,riskSettings,candidate){
   }
   return {ok:true};
 }
-const ZS_BUILD='2026-09-27.3';
+const ZS_BUILD='2026-09-27.4';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
@@ -736,13 +783,25 @@ function evaluatePaperExit(pos,lastPrice){
   }
   return null;
 }
+// Evolution overrides are the same for every pair/strategy in one run, so
+// callers fetch them once (best-effort — a failure just means "no override",
+// never a thrown error) rather than re-querying per pair.
+async function zsGetEvoOverridesSafe(){
+  try{ return await window.ZuShePaperDB?.loadEvoOverrides?.()||{}; }catch(_e){ return {}; }
+}
 async function runPaperEngine(strategy='Combined',pair=PAPER_CONFIG.pair){
   const candles=await DataProviders.luno.getCandles(pair,PAPER_CONFIG.timeframe,PAPER_CONFIG.candleLimit);
   const ticker=await DataProviders.luno.getTicker(pair);
   const lastPrice=Number(ticker.last_trade||ticker.last||0);
   const snapshot={candles,lastPrice,updatedAt:Date.now(),pair};
   paperSave(PAPER_LS.market,snapshot);
-  const signal=evaluatePaperSignal(candles,strategy,pair);
+  let regime='NEUTRAL';
+  try{
+    const h4=await DataProviders.luno.getCandles(pair,14400,PAPER_CONFIG.candleLimit);
+    regime=zsH4Regime(h4);
+  }catch(_e){ /* best effort — ungated (NEUTRAL) if H4 data can't be fetched */ }
+  const evoOverrides=await zsGetEvoOverridesSafe();
+  const signal=evaluatePaperSignal(candles,strategy,pair,evoOverrides,regime);
   paperSave(PAPER_LS.signal,signal);
   return {candles,ticker,lastPrice,signal};
 }
@@ -753,12 +812,18 @@ async function runPaperEngine(strategy='Combined',pair=PAPER_CONFIG.pair){
 // Luno's public rate limits from a mobile connection.
 async function scanWatchlist(strategy='Combined'){
   const results=[];
+  const evoOverrides=await zsGetEvoOverridesSafe();
   for(const w of PAPER_CONFIG.watchlist){
     try{
       const candles=await DataProviders.luno.getCandles(w.id,PAPER_CONFIG.timeframe,PAPER_CONFIG.candleLimit);
       const ticker=await DataProviders.luno.getTicker(w.id);
       const lastPrice=Number(ticker.last_trade||ticker.last||0);
-      const signal=evaluatePaperSignal(candles,strategy,w.id);
+      let regime='NEUTRAL';
+      try{
+        const h4=await DataProviders.luno.getCandles(w.id,14400,PAPER_CONFIG.candleLimit);
+        regime=zsH4Regime(h4);
+      }catch(_e){ /* best effort */ }
+      const signal=evaluatePaperSignal(candles,strategy,w.id,evoOverrides,regime);
       results.push({...signal,label:w.label,lastPrice,ok:true});
     }catch(err){
       results.push({pair:w.id,label:w.label,direction:'NO TRADE',confidence:0,reason:'Data unavailable: '+(err?.message||'network error'),evidence:[],ok:false});
@@ -4559,14 +4624,19 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     // server cron) already enforces this same rule; this mirrors it here.
     if (signal.direction !== 'BUY' && signal.direction !== 'SELL') return;
     const account = zsAccount || await zsEnsureAccount();
-    // The raw signal only carries `price` + `stopDistance`; derive an
-    // indicative entry/stop/target here (mirrors the app's own 1:2 R:R
-    // model) so these columns are actually populated instead of null.
+    // The raw signal carries `price` + `stopDistance` + its own adaptive
+    // `rr` (from evaluateAllPaperSignals/signal-scan — varies per strategy
+    // and stretches with confidence/volume, it is NOT a flat 1:2). Previously
+    // this hard-coded dist*2 regardless of signal.rr, so the saved Signal
+    // Desk row could show a different target than the one the Paper Engine
+    // position creator (which does use signal.rr) would actually trade —
+    // fixed so both derive the take-profit from the same number.
     const hasSetup = true;
     const price = Number(signal.price || 0);
     const dist = Number(signal.stopDistance || 0);
+    const rr = Number(signal.rr) > 0 ? Number(signal.rr) : 2;
     const stopPrice = hasSetup ? (signal.direction === 'BUY' ? price - dist : price + dist) : null;
-    const takeProfit = hasSetup ? (signal.direction === 'BUY' ? price + dist * 2 : price - dist * 2) : null;
+    const takeProfit = hasSetup ? (signal.direction === 'BUY' ? price + dist * rr : price - dist * rr) : null;
     const { error } = await db.from('trader_signals').insert({
       account_id: account?.id || null,
       pair: signal.pair || ZS_PAIR,
@@ -4636,6 +4706,34 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       .order('entry_time', { ascending: false }).limit(limit);
     if (error) { console.warn('[ZuShé Trader] loadEvolutionTrades failed:', error.message || error); return []; }
     return data || [];
+  }
+
+  // Mirrors loadEvoOverrides() in the signal-scan edge function exactly: only
+  // a genome with >=20 real closed trades AND a positive net P/L for its mode
+  // gets to blend its learned rr/stop into the Paper Engine card's signals —
+  // a thin or losing sample can never degrade the fixed defaults. Best-effort:
+  // any failure here should just mean "no override today", not break signal
+  // generation, so callers should use zsGetEvoOverridesSafe (top of file).
+  async function zsLoadEvoOverrides() {
+    const out = {};
+    const pool = await zsLoadStrategyPool();
+    const best = {};
+    for (const g of pool || []) {
+      const mode = g.params?.mode;
+      if (!mode) continue;
+      if ((g.trades_closed || 0) < 20) continue;
+      if (Number(g.net_pnl) <= 0) continue;
+      if (!best[mode] || Number(g.score) > Number(best[mode].score)) best[mode] = g;
+    }
+    for (const mode of Object.keys(best)) {
+      const g = best[mode];
+      out[mode] = {
+        rr: Number(g.params?.rr) || 2,
+        stopMult: Number(g.params?.stop_atr_mult) || 1.8,
+        genome: g.name, trades: g.trades_closed || 0, net: Number(g.net_pnl) || 0
+      };
+    }
+    return out;
   }
 
   // Triggers one real evolution-engine cycle right now (the same function
@@ -5059,6 +5157,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     updatePushPrefs: zsUpdatePushPrefs,
     loadEvolutionAccount: zsLoadEvolutionAccount,
     loadStrategyPool: zsLoadStrategyPool,
+    loadEvoOverrides: zsLoadEvoOverrides,
     loadEvolutionTrades: zsLoadEvolutionTrades,
     runEvolutionEngine: zsRunEvolutionEngine,
     loadStrategyReview: zsLoadStrategyReview,
