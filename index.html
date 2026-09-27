@@ -411,6 +411,7 @@ const PAPER_LS={
   stats:'zsd_paper_stats',
   watchPair:'zsd_paper_watch_pair',
   watchStrategy:'zsd_paper_watch_strategy',
+  watchAuto:'zsd_paper_watch_auto',
   scan:'zsd_paper_scan',
   sentiment:'zsd_paper_sentiment'
 };
@@ -685,7 +686,7 @@ function paperRiskAllowed(stats,account,riskSettings,candidate){
   }
   return {ok:true};
 }
-const ZS_BUILD='2026-09-27.1';
+const ZS_BUILD='2026-09-27.2';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
@@ -974,7 +975,7 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
   const[scan,setScan]=useState(()=>paperLoad(PAPER_LS.scan,{results:[],updatedAt:0}));
   const[sentiment,setSentiment]=useState(()=>paperLoad(PAPER_LS.sentiment,null));
   const[dataOk,setDataOk]=useState(true);
-  const[auto,setAuto]=useState(false);
+  const[auto,setAuto]=useState(()=>paperLoad(PAPER_LS.watchAuto,false));
 
   const label=(PAPER_CONFIG.watchlist.find(w=>w.id===pair)||{}).label||pair;
 
@@ -1036,12 +1037,10 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
 
   const focusPair=(id)=>{
     setPair(id); paperSave(PAPER_LS.watchPair,id);
-    run(id,strategy);
   };
 
   const focusStrategy=(s)=>{
     setStrategy(s); paperSave(PAPER_LS.watchStrategy,s);
-    run(pair,s);
   };
 
   const loadSentiment=async()=>{
@@ -1067,12 +1066,21 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
 
   // (Server reconciliation now lives in App.syncFromServer.)
 
+  // Always re-evaluate whenever the selected pair or strategy changes (and
+  // on mount/tab-return) so `signal` can never lag behind what's currently
+  // selected. Previously this only ran when `auto` was on, and the manual
+  // pair/strategy buttons fired a separate run() that could be interrupted
+  // by navigating away mid-fetch — leaving a stale, mismatched `signal.pair`
+  // (loaded from localStorage) behind. That stale mismatch is exactly what
+  // made "Open Paper Trade" look permanently greyed out for every pair/
+  // strategy except whichever one last finished evaluating.
+  useEffect(()=>{ run(pair,strategy); },[pair,strategy]);
+
   useEffect(()=>{
     if(!auto)return;
     const id=setInterval(()=>run(pair,strategy),300000);
-    run(pair,strategy);
     return()=>clearInterval(id);
-  },[auto,strategy]);
+  },[auto,pair,strategy]);
 
   const c=signal.direction==='BUY'?'var(--green)':signal.direction==='SELL'?'var(--red)':'var(--amber)';
   const freshMs=Date.now()-(market.updatedAt||0);
@@ -1138,7 +1146,7 @@ function PaperEngineCard({account,setAccount,showToast,riskSettings}){
       ))
     ):null,
     e('label',{style:{display:'flex',alignItems:'center',gap:8,fontSize:10,color:'var(--text3)',marginTop:2}},
-      e('input',{type:'checkbox',checked:auto,onChange:ev=>setAuto(ev.target.checked)}),
+      e('input',{type:'checkbox',checked:auto,onChange:ev=>{const v=ev.target.checked;setAuto(v);paperSave(PAPER_LS.watchAuto,v);}}),
       'Auto-refresh every 5 minutes (paper evaluation + real stop/target checks only)'
     ),
     e('div',{style:{fontSize:9,color:'var(--text3)',marginTop:8,lineHeight:1.4}},
@@ -1488,6 +1496,11 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   const acceptSig=(sig)=>{
     if(sig.dir==='NO TRADE'){showToast('This is not a real setup — nothing to accept.','info');return;}
     if(sig.tradable===false){showToast(sig.pair+' has no live price feed, so it cannot auto-close as a paper trade. Use Watch Only to track it manually.','info');return;}
+    // Same Min Confidence gate acceptAllPending already enforces — this was
+    // previously missing here, which let individual accepts (e.g. tapping a
+    // 66% signal) through even with Risk Vault's Min Confidence set to 72.
+    const minConf=Number.isFinite(Number(riskSettings.minConfidence))?Number(riskSettings.minConfidence):0;
+    if((sig.conf||0)<minConf){showToast('This signal is '+(sig.conf||0)+'% confidence, below your Min Confidence gate ('+minConf+'%) in Risk Vault. Lower it there if you want to accept weaker setups.','warning');return;}
     const stats=paperLoad(PAPER_LS.stats,{dailyLoss:0,lossStreak:0,totalPnL:0});
     const gate=paperRiskAllowed(stats,account,riskSettings,{pair:sig.pair,strategy:sig.strat});
     if(!gate.ok){showToast(gate.reason,'warning');return;}
