@@ -686,7 +686,7 @@ function paperRiskAllowed(stats,account,riskSettings,candidate){
   }
   return {ok:true};
 }
-const ZS_BUILD='2026-09-27.2';
+const ZS_BUILD='2026-09-27.3';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
@@ -3165,9 +3165,15 @@ function zsReadinessOf(sr){
   if(netPnl>0)return{tier:'ready',lbl:'Worth considering',cls:'pill-cyan'};
   return{tier:'caution',lbl:'Breaking even',cls:'pill-watch'};
 }
+// Maps a paper strategy name to the evolution engine's genome "mode" family -
+// same correspondence signal-scan uses to feed evolution's learning into the
+// signals you accept. Breakout/Pullback have no evolution-engine equivalent.
+const ZS_STRATEGY_TO_EVO_MODE={'Combined':'combined','Trend Rider':'trend','Momentum':'momentum','Mean Reversion':'mean_reversion'};
+
 function LiveReadiness({showToast}){
   const[rows,setRows]=useState([]);
   const[flags,setFlags]=useState(null);
+  const[evoPool,setEvoPool]=useState([]);
   const[loading,setLoading]=useState(false);
   const[resetting,setResetting]=useState(false);
 
@@ -3175,18 +3181,36 @@ function LiveReadiness({showToast}){
     if(!window.ZuShePaperDB)return;
     setLoading(true);
     try{
-      const[sr,fl]=await Promise.all([
+      const[sr,fl,ep]=await Promise.all([
         window.ZuShePaperDB.loadStrategyReview(),
-        window.ZuShePaperDB.getSystemFlags().catch(()=>null)
+        window.ZuShePaperDB.getSystemFlags().catch(()=>null),
+        window.ZuShePaperDB.loadStrategyPool().catch(()=>[])
       ]);
       setRows(sr||[]);
       setFlags(fl||null);
+      setEvoPool(ep||[]);
     }catch(err){
       showToast&&showToast('Could not load live-readiness data: '+(err?.message||err),'error');
     }finally{
       setLoading(false);
     }
   },[showToast]);
+
+  // Best ACTIVE genome per mode, by score — same "best" a matching paper
+  // strategy would actually receive from signal-scan's evolution feedback.
+  // Shown as its OWN, separate figures (not merged into the paper strategy's
+  // numbers above it) since they come from a completely separate sandbox
+  // account with its own trade history.
+  const evoBestByMode=useMemo(()=>{
+    const out={};
+    for(const g of evoPool){
+      if(g.status!=='active')continue;
+      const mode=g.params&&g.params.mode;
+      if(!mode)continue;
+      if(!out[mode]||Number(g.score)>Number(out[mode].score))out[mode]=g;
+    }
+    return out;
+  },[evoPool]);
 
   // Sets a cutover timestamp server-side (trader_system_flags.stats_reset_at). The
   // strategy-review edge function then only counts trades that CLOSED at/after this
@@ -3330,7 +3354,39 @@ function LiveReadiness({showToast}){
                       e('div',{style:{fontSize:9,color:b.winRate==null?'var(--text3)':b.winRate>=50?'var(--green)':'var(--red)'}},b.winRate==null?'—':Math.round(b.winRate)+'% win')
                     );
                   })
-                )
+                ),
+              // Evolution Engine's own figures for the matching genome mode -
+              // shown separately (own account, own trade history), never
+              // blended into the paper numbers above. This is what signal-scan
+              // draws on to tune this strategy's TP/SL once a genome here has
+              // >=20 closed trades and a positive net P/L.
+              (()=>{
+                const mode=ZS_STRATEGY_TO_EVO_MODE[sr.strategy];
+                const g=mode&&evoBestByMode[mode];
+                if(!g)return null;
+                const gNet=Number(g.net_pnl)||0;
+                const feeding=(g.trades_closed||0)>=20&&gNet>0;
+                return e('div',{style:{marginTop:8,paddingTop:8,borderTop:'1px solid var(--border)'}},
+                  e('div',{style:{fontSize:9,color:'var(--purple)',letterSpacing:1,marginBottom:4}},'EVOLUTION ENGINE — BEST GENOME ('+g.name+')'),
+                  e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:6,textAlign:'center'}},
+                    e('div',null,
+                      e('div',{style:{fontSize:8,color:'var(--text3)'}},'CLOSED'),
+                      e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:11}},g.trades_closed||0)
+                    ),
+                    e('div',null,
+                      e('div',{style:{fontSize:8,color:'var(--text3)'}},'WIN RATE'),
+                      e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:11}},(g.win_rate!=null?Math.round(g.win_rate):0)+'%')
+                    ),
+                    e('div',null,
+                      e('div',{style:{fontSize:8,color:'var(--text3)'}},'NET P/L'),
+                      e('div',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:11,color:gNet>=0?'var(--green)':'var(--red)'}},(gNet>=0?'+':'')+fmtCur(gNet))
+                    )
+                  ),
+                  e('div',{style:{fontSize:9,color:feeding?'var(--green)':'var(--text3)',marginTop:4}},
+                    feeding?'✓ Proven — currently tuning this strategy\'s TP/SL in signal-scan.':'Not yet proven (needs ≥20 closed trades and positive net) — not influencing signals yet.'
+                  )
+                );
+              })()
             );
           }),
 
