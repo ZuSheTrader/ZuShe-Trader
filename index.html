@@ -878,6 +878,8 @@ function createPaperPosition(signal,balance,riskSettings){
 // returns the real exit price and outcome — never a randomised result.
 function evaluatePaperExit(pos,lastPrice){
   if(!pos||!Number.isFinite(lastPrice)||lastPrice<=0)return null;
+  // Past its max holding time: leave it to the server's paper-exit-check, which books TIME_WIN / TIME_LOSS at the real market price.
+  if(pos.maxHold&&pos.openedAt&&Date.now()>=pos.openedAt+pos.maxHold*60000)return null;
   if(pos.dir==='BUY'){
     if(lastPrice<=pos.sl)return {exitPrice:pos.sl,status:'Loss',trigger:'Stop-loss'};
     if(lastPrice>=pos.tp)return {exitPrice:pos.tp,status:'Win',trigger:'Take-profit'};
@@ -1477,6 +1479,16 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,li
 // Maps a raw trader_signals row (written by the signal-scan cron) onto the
 // shape the Signal Desk UI was originally built around, so the existing
 // SigCard rendering keeps working unchanged.
+// Horizon / hold-time metadata a signal carries into the paper trade so the
+// server-side paper-exit-check can enforce the time exit (TIME_WIN / TIME_LOSS).
+function zsSigTradeMeta(sig){
+  return {tfSec:sig.tfSec||null,horizon:sig.horizon||'SWING',maxHold:sig.maxHold||null,assetClass:sig.assetClass||'CRYPTO',provider:sig.provider||'luno',regime:sig.regime||null,quality:sig.quality!=null?sig.quality:null};
+}
+// A short-horizon signal's entry price goes stale quickly; the scanner expires them server-side too.
+function zsSigFresh(sig){
+  if(!sig||!sig.maxHold||!sig.createdMs)return true;
+  return (Date.now()-sig.createdMs)<=(sig.horizon==='SCALP'?10:45)*60000;
+}
 function zsSignalTF(seconds){
   const map={60:'M1',300:'M5',900:'M15',1800:'M30',3600:'H1',14400:'H4',86400:'D1'};
   return map[seconds]||(seconds?Math.round(seconds/60)+'m':'H1');
@@ -1504,6 +1516,7 @@ function zsExitBucket(t){
   const trig=String(t.trigger||'').toLowerCase();
   if(trig==='take-profit'||trig.includes('take-profit'))return 'tp';
   if(trig==='stop-loss'||trig.includes('stop-loss'))return 'sl';
+  if(trig==='time_win'||trig==='time_loss')return 'time';
   return 'manual';
 }
 // Saves a close to Supabase, then rebuilds the account balance from the sum of ALL closed trades
@@ -1518,7 +1531,7 @@ function zsSettleClose(trade,setAccount){
   }).catch(err=>console.warn('[ZuShé Trader] settle close failed:',err?.message||err));
 }
 function zsRowToPos(t){
-  return {id:'PT-'+String(t.id).slice(0,8),dbId:t.id,pair:t.pair,market:zsPairAsset(t.pair),dir:t.direction,entry:Number(t.entry_price),sl:Number(t.stop_price),tp:Number(t.take_profit),size:Number(t.quantity),risk:Number(t.risk_amount),strategy:t.strategy,strat:t.strategy,confidence:Number(t.metadata&&t.metadata.confidence)||0,openedAt:Date.parse(t.entry_time)||Date.now(),paper:true};
+  return {id:'PT-'+String(t.id).slice(0,8),dbId:t.id,pair:t.pair,market:zsPairAsset(t.pair),dir:t.direction,entry:Number(t.entry_price),sl:Number(t.stop_price),tp:Number(t.take_profit),size:Number(t.quantity),risk:Number(t.risk_amount),strategy:t.strategy,strat:t.strategy,confidence:Number(t.metadata&&t.metadata.confidence)||0,openedAt:Date.parse(t.entry_time)||Date.now(),paper:true,horizon:t.horizon||'SWING',tfSec:Number(t.timeframe)||null,maxHold:t.max_hold_minutes?Number(t.max_hold_minutes):null,regime:t.regime||null};
 }
 function zsRowToClosed(t){
   const pl=Number(t.net_pnl)||0;
@@ -1599,7 +1612,16 @@ function mapDbSignalToUi(row,account,riskSettings){
     reason:row.decision_reason||'',
     source:row.source||'ai_scan',
     tradable:!(row.source_meta&&row.source_meta.tradable===false),
-    channel:(row.source_meta&&row.source_meta.channel_or_author)||''
+    channel:(row.source_meta&&row.source_meta.channel_or_author)||'',
+    horizon:row.horizon||'SWING',
+    tfSec:Number(row.timeframe)||null,
+    maxHold:row.max_hold_minutes?Number(row.max_hold_minutes):null,
+    assetClass:row.asset_class||'CRYPTO',
+    provider:row.provider||'luno',
+    regime:row.regime||null,
+    quality:row.quality_score!=null?Number(row.quality_score):null,
+    reasonsList:Array.isArray(row.reasons)?row.reasons:[],
+    createdMs:row.created_at?Date.parse(row.created_at):null
   };
 }
 
@@ -1693,6 +1715,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   const acceptedClosedTp=accepted.filter(s=>closedSigBucket[s.id]==='tp');
   const acceptedClosedSl=accepted.filter(s=>closedSigBucket[s.id]==='sl');
   const acceptedClosedManual=accepted.filter(s=>closedSigBucket[s.id]==='manual');
+  const acceptedClosedTime=accepted.filter(s=>closedSigBucket[s.id]==='time');
 
   // Downscale to max 1600px JPEG so phone screenshots stay well under API/body limits.
   const fileToBase64=(file)=>new Promise((resolve,reject)=>{
@@ -1737,6 +1760,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   const acceptSig=(sig)=>{
     if(sig.dir==='NO TRADE'){showToast('This is not a real setup — nothing to accept.','info');return;}
     if(sig.tradable===false){showToast(sig.pair+' has no live price feed, so it cannot auto-close as a paper trade. Use Watch Only to track it manually.','info');return;}
+    if(!zsSigFresh(sig)){showToast('This '+sig.horizon+' signal is too old — its entry price is stale. Wait for the next scan.','warning');return;}
     // Same Min Confidence gate acceptAllPending already enforces — this was
     // previously missing here, which let individual accepts (e.g. tapping a
     // 66% signal) through even with Risk Vault's Min Confidence set to 72.
@@ -1747,7 +1771,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     if(!gate.ok){showToast(gate.reason,'warning');return;}
     const risk=parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings,sig.conf)).toFixed(2));
     const size=paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings,sig.conf);
-    const pos={id:'PT-'+Date.now(),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size,risk,strategy:sig.strat,confidence:sig.conf,openedAt:Date.now(),paper:true,sigId:sig.id};
+    const pos={id:'PT-'+Date.now(),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size,risk,strategy:sig.strat,confidence:sig.conf,openedAt:Date.now(),paper:true,sigId:sig.id,...zsSigTradeMeta(sig)};
     setSignals(ss=>ss.map(s=>s.id===sig.id?{...s,status:'Accepted'}:s));
     setAccount(a=>({...a,openPositions:[...a.openPositions,pos],used:parseFloat((a.used+risk).toFixed(2))}));
     window.ZuShePaperDB?.openTrade?.(pos)?.catch?.(()=>{});
@@ -1766,7 +1790,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   //     correlated same-direction crypto signals filling every open slot at
   //     once, which is exactly what produced 50 simultaneous same-side losers.
   const acceptAllPending=()=>{
-    const cand=pending.filter(s=>s.dir!=='NO TRADE'&&s.tradable!==false);
+    const cand=pending.filter(s=>s.dir!=='NO TRADE'&&s.tradable!==false&&zsSigFresh(s));
     if(!cand.length){showToast('No tradable pending signals to accept.','info');return;}
     const minConf=Number.isFinite(Number(riskSettings.minConfidence))?Number(riskSettings.minConfidence):0;
     const qualified=cand.filter(s=>(s.conf||0)>=minConf).sort((a,b)=>(b.conf||0)-(a.conf||0));
@@ -1801,7 +1825,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     if(skippedRoom)noteParts.push(skippedRoom+' beyond the open-trade limit');
     if(!window.confirm('Open '+chosen.length+' paper trade'+(chosen.length>1?'s':'')+' now, highest confidence first?'+(noteParts.length?'\n('+noteParts.join(', ')+' will stay pending.)':'')+'\n\nEach risks up to '+Number(riskSettings.riskPerTrade)+'% of your paper balance, scaled down for weaker (closer to '+minConf+'%) confidence.'))return;
     const now=Date.now();
-    const newPos=chosen.map((sig,i)=>({id:'PT-'+(now+i),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size:paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings,sig.conf),risk:parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings,sig.conf)).toFixed(2)),strategy:sig.strat,confidence:sig.conf,openedAt:now+i,paper:true,sigId:sig.id}));
+    const newPos=chosen.map((sig,i)=>({id:'PT-'+(now+i),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size:paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings,sig.conf),risk:parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings,sig.conf)).toFixed(2)),strategy:sig.strat,confidence:sig.conf,openedAt:now+i,paper:true,sigId:sig.id,...zsSigTradeMeta(sig)}));
     const ids=new Set(chosen.map(s=>s.id));
     setSignals(ss=>ss.map(s=>ids.has(s.id)?{...s,status:'Accepted'}:s));
     const totalRisk=newPos.reduce((sum,p)=>sum+p.risk,0);
@@ -1832,11 +1856,12 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     {id:'open',lbl:'Open',cnt:acceptedOpen.length,desc:'Accepted and still running'},
     {id:'closedTp',lbl:'Closed · TP',cnt:acceptedClosedTp.length,desc:'Closed by take-profit'},
     {id:'closedSl',lbl:'Closed · SL',cnt:acceptedClosedSl.length,desc:'Closed by stop-loss'},
+    {id:'closedTime',lbl:'Closed · Time',cnt:acceptedClosedTime.length,desc:'Closed at the max holding time, at the real market price'},
     {id:'closedManual',lbl:'Closed · Manual',cnt:acceptedClosedManual.length,desc:'You closed these yourself'},
     {id:'watching',lbl:'Watching',cnt:watching.length,desc:'Monitoring outcome without a position'},
     {id:'rejected',lbl:'Rejected',cnt:rejected.length,desc:'You declined these signals'},
   ];
-  const list={pending,open:acceptedOpen,closedTp:acceptedClosedTp,closedSl:acceptedClosedSl,closedManual:acceptedClosedManual,watching,rejected}[tab]||[];
+  const list={pending,open:acceptedOpen,closedTp:acceptedClosedTp,closedSl:acceptedClosedSl,closedManual:acceptedClosedManual,closedTime:acceptedClosedTime,watching,rejected}[tab]||[];
 
   const SigCard=({sig,livePrice})=>e('div',{className:'sig-card sig-'+sig.dir.toLowerCase()},
     e('div',{className:'sig-accent'}),
@@ -1851,7 +1876,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
             e('span',{style:{fontWeight:800,fontSize:16}},sig.market)
           ),
           e('div',{style:{fontSize:11,color:'var(--text3)'}},
-            sig.source==='telegram'?('📨 Telegram'+(sig.channel?' · '+sig.channel:'')+(sig.tradable===false?' · manual track only':'')):(sig.strat+' · '+sig.tf+' chart'),' · Signal at ',sig.time
+            sig.source==='telegram'?('📨 Telegram'+(sig.channel?' · '+sig.channel:'')+(sig.tradable===false?' · manual track only':'')):(sig.strat+' · '+sig.tf+' chart'+(sig.horizon&&sig.horizon!=='SWING'?' · '+sig.horizon+(sig.maxHold?' · '+sig.maxHold+'m max hold':''):'')+(sig.quality!=null?' · Q'+sig.quality:'')),' · Signal at ',sig.time
           )
         ),
         e('div',{style:{textAlign:'right'}},
@@ -2471,6 +2496,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
   const tpTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='tp'),[account.closedTrades]);
   const slTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='sl'),[account.closedTrades]);
   const manualTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='manual'),[account.closedTrades]);
+  const timeTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='time'),[account.closedTrades]);
   const groupStats=(list)=>{
     const gw=list.filter(t=>t.pl>0),gl=list.filter(t=>t.pl<=0);
     const net=list.reduce((s,t)=>s+(Number(t.pl)||0),0);
@@ -2485,7 +2511,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
     const rMult=risk>0?(t.pl/risk):null;
     const dur=zsFmtDuration((t.closeTime?new Date(t.closeTime).getTime():Date.now())-(t.openedAt||0));
     const trigLbl=bucket==='tp'?'Take-Profit':bucket==='sl'?'Stop-Loss':(t.trigger||'Manual close');
-    const trigCls=bucket==='tp'?'pill-cyan':bucket==='sl'?'pill-watch':'pill-purple';
+    const trigCls=bucket==='tp'?'pill-cyan':bucket==='sl'?'pill-watch':bucket==='time'?(t.pl>=0?'pill-cyan':'pill-watch'):'pill-purple';
     return e('div',{key:t.id||'ct_'+i,className:'card card-sm'},
       e('div',{className:'row',style:{marginBottom:6}},
         e('div',{style:{display:'flex',gap:8,alignItems:'center'}},
@@ -2703,6 +2729,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
           :e('div',null,
               renderClosedGroup('tp','🎯','Take-Profit Hits','Auto-closed at your target price',tpTrades,'tp','No trades have hit Take-Profit yet.'),
               renderClosedGroup('sl','🛑','Stop-Loss Hits','Auto-closed to limit the loss',slTrades,'sl','No trades have hit Stop-Loss yet.'),
+              renderClosedGroup('time','⏱','Time Exits','Closed at the max holding time using the real market price (TIME_WIN / TIME_LOSS)',timeTrades,'time','No time exits yet.'),
               renderClosedGroup('manual','✋','Manually Closed','You closed these by hand before TP/SL',manualTrades,'manual','No manual closes yet.')
             )
       ),
@@ -4163,10 +4190,11 @@ function AppSettings({showToast,onLogout,account,setAccount,signals,setSignals,s
     closedTp:sigList.filter(s=>s.status==='Accepted'&&closedSigBucket2[s.id]==='tp'),
     closedSl:sigList.filter(s=>s.status==='Accepted'&&closedSigBucket2[s.id]==='sl'),
     closedManual:sigList.filter(s=>s.status==='Accepted'&&closedSigBucket2[s.id]==='manual'),
+    closedTime:sigList.filter(s=>s.status==='Accepted'&&closedSigBucket2[s.id]==='time'),
     watching:sigList.filter(s=>s.status==='Watching'),
     rejected:sigList.filter(s=>s.status==='Rejected'),
   };
-  const clearLabels={pending:'Pending',open:'Open',closedTp:'Closed · TP',closedSl:'Closed · SL',closedManual:'Closed · Manual',watching:'Watching',rejected:'Rejected'};
+  const clearLabels={pending:'Pending',open:'Open',closedTp:'Closed · TP',closedSl:'Closed · SL',closedManual:'Closed · Manual',closedTime:'Closed · Time',watching:'Watching',rejected:'Rejected'};
 
   async function clearSignalBucket(key){
     const items=key==='all'?sigList:sigBuckets[key];
@@ -5044,7 +5072,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       account_id: account?.id || null,
       strategy: trade.strategy || 'Combined',
       pair: trade.pair,
-      timeframe: PAPER_CONFIG.timeframe,
+      timeframe: Number(trade.tfSec) || PAPER_CONFIG.timeframe,
       direction: trade.dir,
       status: 'OPEN',
       entry_price: Number(trade.entry) || 0,
@@ -5052,8 +5080,14 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       take_profit: Number(trade.tp) || 0,
       quantity: Number(trade.size) || 0,
       risk_amount: Number(trade.risk) || 0,
+      horizon: trade.horizon || 'SWING',
+      max_hold_minutes: trade.maxHold ? Number(trade.maxHold) : null,
+      asset_class: trade.assetClass || 'CRYPTO',
+      provider: trade.provider || 'luno',
+      regime: trade.regime || null,
+      quality_score: trade.quality != null ? Number(trade.quality) : null,
       entry_time: new Date(trade.openedAt || Date.now()).toISOString(),
-      metadata: { local_id: trade.id, confidence: Number(trade.confidence || 0) }
+      metadata: { local_id: trade.id, confidence: Number(trade.confidence || 0), max_hold_minutes: trade.maxHold ? Number(trade.maxHold) : null }
     };
     const { error } = await db.from('trader_paper_trades').insert(payload);
     if (error) console.warn('[ZuShé Trader] openTrade failed:', error.message || error);
