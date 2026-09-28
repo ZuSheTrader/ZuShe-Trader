@@ -2013,7 +2013,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
             e('div',{className:'empty-icon'},'📡'),
             e('div',{className:'empty-title'},'No '+({pending:'pending',open:'open',closedTp:'TP-closed',closedSl:'SL-closed',closedManual:'manually closed',watching:'watching',rejected:'rejected'}[tab]||tab)+' signals'),
             e('div',{className:'empty-sub'},{
-              pending:'A background scan checks BTC, ETH, XRP and LTC (vs ZAR) on four timeframes (M15, M30, H1, H4) every 5 minutes, running six strategies: Combined, Trend Rider, Momentum, Mean Reversion, Breakout and Pullback. New signals appear here when one of them lines up — tap ⟳ Refresh above to check now.',
+              pending:'A background scan checks the active Luno markets (vs ZAR) every 5 minutes across three horizons: SCALP and INTRADAY on M5/M15, and SWING on M30, H1 and H4. It runs the six original strategies plus seven short-term ones (Scalp and Intraday Momentum, Micro Breakout, Mean Reversion). Signals only appear when every rule, spread, cost and higher-timeframe check passes, so long quiet spells are normal — tap ⟳ Refresh above to check now.',
               open:'No open accepted signals yet. Go to Pending to review available signals.',
               closedTp:'No signals have closed on take-profit yet.',
               closedSl:'No signals have closed on stop-loss yet.',
@@ -2389,6 +2389,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
   const[strategyReview,setStrategyReview]=useState([]);
   const[srLoading,setSrLoading]=useState(false);
   const[srBusy,setSrBusy]=useState(null);
+  const[hFilter,setHFilter]=useState('ALL');
   const equity=liveEquity!=null?liveEquity:account.balance;
   const totalReturn=((account.balance-zsStartBal(account))/zsStartBal(account)*100);
   const equityData=zsEquityCurve(account,equity);
@@ -2502,6 +2503,33 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
     const net=list.reduce((s,t)=>s+(Number(t.pl)||0),0);
     return {count:list.length,wins:gw.length,losses:gl.length,net,winRate:list.length?Math.round(gw.length/list.length*100):0};
   };
+
+  // Per-horizon performance (SCALP / INTRADAY / SWING). Trades without a
+  // horizon (older rows) count as SWING, matching zsRowToPos.
+  const ZS_HZ=['SCALP','INTRADAY','SWING'];
+  const horizonOf=t=>ZS_HZ.includes(t.horizon)?t.horizon:'SWING';
+  const hStats=(list)=>{
+    const gw=list.filter(t=>t.pl>0),gl=list.filter(t=>t.pl<=0);
+    const grossWin=gw.reduce((s,t)=>s+(Number(t.pl)||0),0);
+    const grossLoss=Math.abs(gl.reduce((s,t)=>s+(Number(t.pl)||0),0));
+    const net=list.reduce((s,t)=>s+(Number(t.pl)||0),0);
+    const holds=list.map(t=>(t.closeTime?new Date(t.closeTime).getTime():0)-(t.openedAt||0)).filter(x=>x>0);
+    return {
+      count:list.length,wins:gw.length,losses:gl.length,net,
+      winRate:list.length?Math.round(gw.length/list.length*100):0,
+      pf:grossLoss>0?grossWin/grossLoss:(grossWin>0?Infinity:null),
+      expectancy:list.length?net/list.length:0,
+      avgHoldMs:holds.length?holds.reduce((a,b)=>a+b,0)/holds.length:null,
+      timeExits:list.filter(t=>zsExitBucket(t)==='time').length
+    };
+  };
+  const hTrades=hFilter==='ALL'?account.closedTrades:account.closedTrades.filter(t=>horizonOf(t)===hFilter);
+  const hAll=useMemo(()=>hStats(account.closedTrades),[account.closedTrades]);
+  const hRows=useMemo(()=>ZS_HZ.map(h=>({h,st:hStats(account.closedTrades.filter(t=>horizonOf(t)===h))})),[account.closedTrades]);
+  const hWins=hTrades.filter(t=>t.pl>0),hLosses=hTrades.filter(t=>t.pl<=0);
+  const hWinRate=hTrades.length>0?Math.round(hWins.length/hTrades.length*100):0;
+  const hNet=hTrades.reduce((s,t)=>s+(Number(t.pl)||0),0);
+  const fmtPF=v=>v==null?'--':(v===Infinity?'∞':v.toFixed(2));
 
   // One closed-trade card with everything needed to understand the trade at a
   // glance: direction/pair, P/L + R-multiple, entry->exit, SL/TP, strategy,
@@ -2772,15 +2800,38 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
             })
         ),
         e('div',{className:'card'},
-          e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:14}},'PERFORMANCE ANALYSIS'),
+          e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:4}},'PERFORMANCE BY HORIZON'),
+          e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:10,lineHeight:1.5}},'Scalp, intraday and swing trades behave very differently, so they are scored separately. Profit factor here is total wins divided by total losses, after fees. Tap a filter to focus the analysis card below.'),
+          e('div',{style:{display:'flex',gap:6,marginBottom:12,flexWrap:'wrap'}},
+            ['ALL',...ZS_HZ].map(h=>e('button',{key:h,className:'btn btn-xs '+(hFilter===h?'btn-outline':'btn-ghost'),onClick:()=>setHFilter(h)},h+' ('+(h==='ALL'?hAll.count:(hRows.find(r=>r.h===h)||{st:{count:0}}).st.count)+')'))
+          ),
+          hRows.map(({h,st})=>e('div',{key:h,style:{borderTop:'1px solid var(--border)',paddingTop:8,marginTop:8,opacity:hFilter==='ALL'||hFilter===h?1:.45}},
+            e('div',{className:'row',style:{marginBottom:3}},
+              e('span',{style:{fontWeight:700,fontSize:12}},h),
+              e('span',{style:{fontFamily:'var(--mono)',fontWeight:700,fontSize:12,color:st.net>=0?'var(--green)':'var(--red)'}},st.count?((st.net>=0?'+':'')+fmtCur(st.net)):'--')
+            ),
+            st.count===0
+              ?e('div',{style:{fontSize:11,color:'var(--text3)'}},'No closed '+h.toLowerCase()+' trades yet.')
+              :e('div',{style:{fontSize:11,color:'var(--text3)',lineHeight:1.6}},
+                  st.count+' trades · '+st.winRate+'% win · PF '+fmtPF(st.pf)+
+                  ' · avg '+(st.expectancy>=0?'+':'')+fmtCur(st.expectancy)+'/trade'+
+                  (st.avgHoldMs?' · avg hold '+zsFmtDuration(st.avgHoldMs):'')+
+                  (st.timeExits?' · '+st.timeExits+' time exit'+(st.timeExits!==1?'s':''):'')
+                )
+          ))
+        ),
+        e('div',{className:'card'},
+          e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:14}},'PERFORMANCE ANALYSIS'+(hFilter==='ALL'?'':' · '+hFilter)),
           ...[
-            {l:'Total Closed Trades',v:account.closedTrades.length,d:'Total number of completed demo trades'},
-            {l:'Winning Trades',v:wins.length,c:'var(--green)',d:wins.length+' trades closed in profit'},
-            {l:'Losing Trades',v:losses.length,c:'var(--red)',d:losses.length+' trades closed at a loss'},
-            {l:'Win Rate',v:account.closedTrades.length>0?winRate+'%':'—',c:winRate>=50?'var(--green)':'var(--red)',d:'Percentage of trades that were profitable. 50%+ is positive, but profitability also depends on the size of wins vs losses (profit factor).'},
-            {l:'Best Winning Trade',v:wins.length>0?'+'+fmtCur(Math.max(...wins.map(t=>t.pl))):'—',c:'var(--green)',d:'Your single biggest profitable trade'},
-            {l:'Worst Losing Trade',v:losses.length>0?fmtCur(Math.min(...losses.map(t=>t.pl))):'—',c:'var(--red)',d:'Your single biggest loss'},
-            {l:'Total P/L',v:(account.balance-zsStartBal(account)>=0?'+':'')+fmtCur(account.balance-zsStartBal(account)),c:account.balance>=zsStartBal(account)?'var(--green)':'var(--red)',d:'Total profit or loss from your starting R10,000 balance'},
+            {l:'Total Closed Trades',v:hTrades.length,d:hFilter==='ALL'?'Total number of completed demo trades':'Completed '+hFilter.toLowerCase()+' trades'},
+            {l:'Winning Trades',v:hWins.length,c:'var(--green)',d:hWins.length+' trades closed in profit'},
+            {l:'Losing Trades',v:hLosses.length,c:'var(--red)',d:hLosses.length+' trades closed at a loss'},
+            {l:'Win Rate',v:hTrades.length>0?hWinRate+'%':'--',c:hWinRate>=50?'var(--green)':'var(--red)',d:'Percentage of trades that were profitable. 50%+ is positive, but profitability also depends on the size of wins vs losses (profit factor).'},
+            {l:'Best Winning Trade',v:hWins.length>0?'+'+fmtCur(Math.max(...hWins.map(t=>t.pl))):'--',c:'var(--green)',d:'Your single biggest profitable trade'},
+            {l:'Worst Losing Trade',v:hLosses.length>0?fmtCur(Math.min(...hLosses.map(t=>t.pl))):'--',c:'var(--red)',d:'Your single biggest loss'},
+            hFilter==='ALL'
+              ?{l:'Total P/L',v:(account.balance-zsStartBal(account)>=0?'+':'')+fmtCur(account.balance-zsStartBal(account)),c:account.balance>=zsStartBal(account)?'var(--green)':'var(--red)',d:'Total profit or loss from your starting R10,000 balance'}
+              :{l:hFilter+' Net P/L',v:(hNet>=0?'+':'')+fmtCur(hNet),c:hNet>=0?'var(--green)':'var(--red)',d:'Net profit or loss from closed '+hFilter.toLowerCase()+' trades only, after fees'},
           ].map(({l,v,c,d})=>e('div',{key:l,style:{borderBottom:'1px solid var(--border)',paddingBottom:8,marginBottom:8}},
             e('div',{className:'row'},
               e('div',{style:{fontSize:13,fontWeight:600}},l),
