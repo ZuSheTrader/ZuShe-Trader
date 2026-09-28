@@ -820,12 +820,29 @@ function paperRiskAllowed(stats,account,riskSettings,candidate){
   }
   return {ok:true};
 }
-const ZS_BUILD='2026-09-27.4';
+const ZS_BUILD='2026-09-27.5';
 // Sizing base is capped so a corrupted/inflated balance can never produce absurd position sizes.
 function paperSizingBalance(b){const n=Number(b);return Number.isFinite(n)&&n>0?Math.min(n,200000):10000;}
+// Confidence-scaled sizing multiplier: a signal right at the Min Confidence
+// floor (72) risks only 60% of the normal per-trade risk; a textbook 92+
+// signal risks the full 100%. Same 72→92 curve signal-scan already uses to
+// stretch reward:risk for stronger setups — this is the other half of "risk
+// less on a weaker setup", applied via position size (not the stop, which
+// stays where the setup is genuinely invalidated regardless of confidence).
+// Never exceeds the risk % you set in Risk Vault; it only ever scales down.
+function paperConfidenceSizeMult(confidence){
+  const c=Number(confidence);
+  if(!Number.isFinite(c))return 1;
+  const f=Math.max(0,Math.min(1,(c-72)/20));
+  return 0.6+0.4*f;
+}
 // riskSettings.riskPerTrade is a percent number from the Risk Vault (e.g. 1 = 1%).
 // Falls back to the old hardcoded PAPER_CONFIG fraction only if no settings were passed in.
-function paperRiskPct(riskSettings){ return riskSettings&&Number.isFinite(Number(riskSettings.riskPerTrade))?Number(riskSettings.riskPerTrade)/100:PAPER_CONFIG.riskPerTrade; }
+// confidence is optional — omit it (or pass null) to get the flat, unscaled %.
+function paperRiskPct(riskSettings,confidence){
+  const base=riskSettings&&Number.isFinite(Number(riskSettings.riskPerTrade))?Number(riskSettings.riskPerTrade)/100:PAPER_CONFIG.riskPerTrade;
+  return confidence==null?base:base*paperConfidenceSizeMult(confidence);
+}
 // Fee-aware sizing. The round-trip taker fee (paper-exit-check charges
 // (entry*qty + exit*qty) * TAKER_FEE_RATE, mirrored client-side as
 // PAPER_CONFIG.takerFeeRate) is billed on notional, not on how far price
@@ -835,8 +852,8 @@ function paperRiskPct(riskSettings){ return riskSettings&&Number.isFinite(Number
 // unbudgeted; now the fee is folded into the sizing equation so that a full
 // stop-out (gross loss + fee, using stop price as the fee-basis estimate)
 // costs the risk amount you actually set, not risk-plus-a-hidden-extra.
-function paperPositionSize(balance,entry,stop,riskSettings){
-  const riskBudget=paperSizingBalance(balance)*paperRiskPct(riskSettings);
+function paperPositionSize(balance,entry,stop,riskSettings,confidence){
+  const riskBudget=paperSizingBalance(balance)*paperRiskPct(riskSettings,confidence);
   const distance=Math.abs(entry-stop);
   if(distance<=0)return 0;
   const feeRate=PAPER_CONFIG.takerFeeRate;
@@ -852,7 +869,7 @@ function createPaperPosition(signal,balance,riskSettings){
   const tp=signal.direction==='BUY'?entry+signal.stopDistance*rr:entry-signal.stopDistance*rr;
   return {
     id:'PT-'+Date.now(),dbId:zsGenId(),pair:signal.pair,dir:signal.direction,entry,sl:stop,tp,
-    size:paperPositionSize(balance,entry,stop,riskSettings),risk:paperSizingBalance(balance)*paperRiskPct(riskSettings),
+    size:paperPositionSize(balance,entry,stop,riskSettings,signal.confidence),risk:paperSizingBalance(balance)*paperRiskPct(riskSettings,signal.confidence),
     strategy:signal.strategy,confidence:signal.confidence,openedAt:Date.now(),paper:true
   };
 }
@@ -1559,17 +1576,20 @@ function mapDbSignalToUi(row,account,riskSettings){
   const wl=PAPER_CONFIG.watchlist.find(w=>w.id===row.pair);
   const entry=Number(row.entry_price)||0,sl=Number(row.stop_price)||0,tp=Number(row.take_profit)||0;
   const rr=Math.abs(sl-entry)>0?Math.abs(tp-entry)/Math.abs(sl-entry):0;
-  const size=paperPositionSize((account&&account.balance)||PAPER_CONFIG.startingBalance,entry,sl,riskSettings);
+  const conf=Number(row.confidence)||0;
+  const size=paperPositionSize((account&&account.balance)||PAPER_CONFIG.startingBalance,entry,sl,riskSettings,conf);
   const statusMap={pending:'Pending',accepted:'Accepted',watching:'Watching',rejected:'Rejected',expired:'Rejected'};
+  const baseRiskPct=riskSettings?Number(riskSettings.riskPerTrade):(PAPER_CONFIG.riskPerTrade*100);
+  const scaledRiskPct=baseRiskPct*paperConfidenceSizeMult(conf);
   return {
     id:row.id,
     pair:row.pair,
     market:wl?wl.label:row.pair,
     dir:row.direction,
     entry,sl,tp,rr,
-    risk:(riskSettings?Number(riskSettings.riskPerTrade):(PAPER_CONFIG.riskPerTrade*100))+'%',
+    risk:scaledRiskPct.toFixed(2)+'%'+(scaledRiskPct<baseRiskPct-0.001?' (scaled down from '+baseRiskPct+'%)':''),
     size:size?size.toFixed(6)+' '+zsPairAsset(row.pair):'—',
-    conf:Number(row.confidence)||0,
+    conf,
     strat:row.strategy,
     tf:zsSignalTF(row.timeframe),
     status:statusMap[row.status]||'Pending',
@@ -1593,6 +1613,67 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
   const[tgLabel,setTgLabel]=useState('');
   const[tgBusy,setTgBusy]=useState(false);
   const fileRef=useRef(null);
+
+  // ---- Live-trading gate state (for the "Trade LIVE" button below) ------
+  // Independent poll of the same flags/key-status BrokerConnection reads —
+  // kept local here rather than lifted to a shared context, so this screen
+  // works standalone and always reflects the current server-side gates
+  // (which are re-checked again inside broker-order regardless).
+  const[liveFlags,setLiveFlags]=useState(null);
+  const[liveKeyStatus,setLiveKeyStatus]=useState(null);
+  const[liveTrades,setLiveTrades]=useState([]);
+  const[liveBusy,setLiveBusy]=useState(null); // signal id currently being submitted
+  const refreshLiveGates=useCallback(async()=>{
+    if(!window.ZuShePaperDB)return;
+    try{
+      const[fl,ks,lt]=await Promise.all([
+        window.ZuShePaperDB.getSystemFlags(),
+        window.ZuShePaperDB.getTradeKeyStatus(),
+        window.ZuShePaperDB.listLiveTrades().catch(()=>({trades:[]}))
+      ]);
+      setLiveFlags(fl);setLiveKeyStatus(ks);setLiveTrades((lt&&lt.trades)||[]);
+    }catch(_e){/* best effort — Trade LIVE button just stays hidden if this fails */}
+  },[]);
+  useEffect(()=>{
+    let cancelled=false,tries=0;
+    const iv=setInterval(()=>{
+      tries++;
+      if(cancelled)return;
+      if(window.ZuShePaperDB||tries>20){clearInterval(iv);refreshLiveGates();}
+    },150);
+    return()=>{cancelled=true;clearInterval(iv);};
+  },[refreshLiveGates]);
+  const canGoLive=!!(liveFlags&&liveFlags.live_trading_enabled&&!liveFlags.kill_switch_active&&liveKeyStatus&&liveKeyStatus.configured);
+  const liveTradeBySig=useMemo(()=>{
+    const m={};(liveTrades||[]).forEach(t=>{if(t.signal_id)m[t.signal_id]=t;});return m;
+  },[liveTrades]);
+  const tradeLive=async(sig)=>{
+    if(sig.dir!=='BUY'){showToast('Live entry only supports BUY signals — Luno spot has no short-selling. This one can only be paper-traded.','warning');return;}
+    if(!canGoLive){showToast('Live trading isn’t armed yet — check the key, order cap, and Live Trading switch in Broker Connection.','warning');return;}
+    const confirmMsg='This places a REAL market BUY order on your Luno account for '+sig.market+' using real ZAR, sized from your live risk settings in Broker Connection. It will be monitored and auto-closed at TP R'+sig.tp.toFixed(2)+' or SL R'+sig.sl.toFixed(2)+'. This is not a simulation.\n\nType-confirm by pressing OK only if you want to risk real money right now.';
+    if(!window.confirm(confirmMsg))return;
+    setLiveBusy(sig.id);
+    try{
+      const res=await window.ZuShePaperDB.openLiveTrade(sig);
+      if(res&&res.error){showToast(res.error,'error');}
+      else{
+        setSignals(ss=>ss.map(s=>s.id===sig.id?{...s,status:'Accepted'}:s));
+        window.ZuShePaperDB?.decideSignal?.(sig.id,'accepted','Opened LIVE (real money)')?.catch?.(()=>{});
+        showToast('🔴 LIVE order placed on Luno — position opened and being monitored for TP/SL.','success');
+        await refreshLiveGates();
+        setShowDetail(null);
+      }
+    }catch(err){showToast('Live order failed: '+(err&&err.message||err),'error');}
+    setLiveBusy(null);
+  };
+  const closeLiveNow=async(liveTrade)=>{
+    if(!window.confirm('Close this LIVE position now at market price? This places a REAL sell order.'))return;
+    try{
+      const res=await window.ZuShePaperDB.closeLiveTrade(liveTrade.id);
+      if(res&&res.error)showToast(res.error,'error');
+      else{showToast('Live position closed.','success');await refreshLiveGates();}
+    }catch(err){showToast('Close failed: '+(err&&err.message||err),'error');}
+  };
   const bySource=srcTab==='all'?signals:signals.filter(s=>(s.source||'ai_scan')===srcTab);
   const pending=bySource.filter(s=>s.status==='Pending');
   const accepted=bySource.filter(s=>s.status==='Accepted');
@@ -1664,8 +1745,8 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     const stats=paperLoad(PAPER_LS.stats,{dailyLoss:0,lossStreak:0,totalPnL:0});
     const gate=paperRiskAllowed(stats,account,riskSettings,{pair:sig.pair,strategy:sig.strat});
     if(!gate.ok){showToast(gate.reason,'warning');return;}
-    const risk=parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings)).toFixed(2));
-    const size=paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings);
+    const risk=parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings,sig.conf)).toFixed(2));
+    const size=paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings,sig.conf);
     const pos={id:'PT-'+Date.now(),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size,risk,strategy:sig.strat,confidence:sig.conf,openedAt:Date.now(),paper:true,sigId:sig.id};
     setSignals(ss=>ss.map(s=>s.id===sig.id?{...s,status:'Accepted'}:s));
     setAccount(a=>({...a,openPositions:[...a.openPositions,pos],used:parseFloat((a.used+risk).toFixed(2))}));
@@ -1718,13 +1799,13 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     if(belowConfN)noteParts.push(belowConfN+' below '+minConf+'% confidence');
     if(skippedConcentration)noteParts.push(skippedConcentration+' blocked by per-market/strategy limits');
     if(skippedRoom)noteParts.push(skippedRoom+' beyond the open-trade limit');
-    if(!window.confirm('Open '+chosen.length+' paper trade'+(chosen.length>1?'s':'')+' now, highest confidence first?'+(noteParts.length?'\n('+noteParts.join(', ')+' will stay pending.)':'')+'\n\nEach risks '+Number(riskSettings.riskPerTrade)+'% of your paper balance.'))return;
+    if(!window.confirm('Open '+chosen.length+' paper trade'+(chosen.length>1?'s':'')+' now, highest confidence first?'+(noteParts.length?'\n('+noteParts.join(', ')+' will stay pending.)':'')+'\n\nEach risks up to '+Number(riskSettings.riskPerTrade)+'% of your paper balance, scaled down for weaker (closer to '+minConf+'%) confidence.'))return;
     const now=Date.now();
-    const perRisk=parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings)).toFixed(2));
-    const newPos=chosen.map((sig,i)=>({id:'PT-'+(now+i),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size:paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings),risk:perRisk,strategy:sig.strat,confidence:sig.conf,openedAt:now+i,paper:true,sigId:sig.id}));
+    const newPos=chosen.map((sig,i)=>({id:'PT-'+(now+i),dbId:zsGenId(),pair:sig.pair,dir:sig.dir,entry:sig.entry,sl:sig.sl,tp:sig.tp,size:paperPositionSize(account.balance,sig.entry,sig.sl,riskSettings,sig.conf),risk:parseFloat((paperSizingBalance(account.balance)*paperRiskPct(riskSettings,sig.conf)).toFixed(2)),strategy:sig.strat,confidence:sig.conf,openedAt:now+i,paper:true,sigId:sig.id}));
     const ids=new Set(chosen.map(s=>s.id));
     setSignals(ss=>ss.map(s=>ids.has(s.id)?{...s,status:'Accepted'}:s));
-    setAccount(a=>({...a,openPositions:[...a.openPositions,...newPos],used:parseFloat((a.used+perRisk*newPos.length).toFixed(2))}));
+    const totalRisk=newPos.reduce((sum,p)=>sum+p.risk,0);
+    setAccount(a=>({...a,openPositions:[...a.openPositions,...newPos],used:parseFloat((a.used+totalRisk).toFixed(2))}));
     newPos.forEach(pos=>{
       window.ZuShePaperDB?.openTrade?.(pos)?.catch?.(()=>{});
       window.ZuShePaperDB?.decideSignal?.(pos.sigId,'accepted')?.catch?.(()=>{});
@@ -1837,12 +1918,19 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
         '⚠️ Overfitting Risk: ',sig.overfit,' — The strategy generating this signal has a '+sig.overfit.toLowerCase()+' risk of being overfitted to past data. Be more cautious.'
       ),
       // Status messages
-      sig.status==='Accepted'&&e('div',{style:{fontSize:12,color:'var(--green)',marginTop:8,padding:'8px 10px',background:'var(--green-dim)',borderRadius:8}},'✅ You accepted this signal. A real paper position has been opened and will auto-close at TP or SL against live prices. Monitor it in the Portfolio tab.'),
+      sig.status==='Accepted'&&!liveTradeBySig[sig.id]&&e('div',{style:{fontSize:12,color:'var(--green)',marginTop:8,padding:'8px 10px',background:'var(--green-dim)',borderRadius:8}},'✅ You accepted this signal. A real paper position has been opened and will auto-close at TP or SL against live prices. Monitor it in the Portfolio tab.'),
+      sig.status==='Accepted'&&liveTradeBySig[sig.id]&&(()=>{const lt=liveTradeBySig[sig.id];return e('div',{style:{fontSize:12,color:'var(--red)',marginTop:8,padding:'8px 10px',background:'rgba(255,60,60,.08)',border:'1px solid rgba(255,60,60,.25)',borderRadius:8}},
+        lt.status==='OPEN'?'🔴 LIVE — real R'+Number(lt.zar_amount).toFixed(2)+' position open at ~R'+Number(lt.entry_price).toFixed(2)+'. Will auto-close at TP R'+Number(lt.take_profit).toFixed(2)+' / SL R'+Number(lt.stop_price).toFixed(2)+'.'
+          :lt.status==='CLOSED'?'🔴 LIVE — closed ('+lt.exit_reason+'): '+(Number(lt.net_pnl)>=0?'+':'')+'R'+Number(lt.net_pnl).toFixed(2)+' net, real money.'
+          :'🔴 LIVE — closing now…',
+        lt.status==='OPEN'&&e('div',{style:{marginTop:6}},e('button',{className:'btn btn-ghost btn-sm',onClick:()=>closeLiveNow(lt)},'Close Now (real order)'))
+      );})(),
       sig.status==='Watching'&&e('div',{style:{fontSize:12,color:'var(--amber)',marginTop:8,padding:'8px 10px',background:'var(--amber-dim)',borderRadius:8}},'👁 You are watching this signal without a position. ZuShé will log whether it would have been profitable.'),
       sig.status==='Rejected'&&e('div',{style:{fontSize:12,color:'var(--text3)',marginTop:8,padding:'8px 10px',background:'var(--glass)',borderRadius:8}},'✕ You rejected this signal.'+(sig.reason?' Reason: '+sig.reason:'')+' It has been saved to your journal.'),
       // Action buttons
       sig.status==='Pending'&&e('div',{className:'btn-row'},
         e('button',{className:'btn btn-green btn-sm',onClick:()=>acceptSig(sig)},'✓ Accept — Open Paper Trade'),
+        sig.dir==='BUY'&&canGoLive&&e('button',{className:'btn btn-red btn-sm',disabled:liveBusy===sig.id,onClick:()=>tradeLive(sig)},liveBusy===sig.id?'Placing…':'⚡ Accept — Trade LIVE'),
         e('button',{className:'btn btn-ghost btn-sm',onClick:()=>watchSig(sig)},'👁 Watch Only'),
         e('button',{className:'btn btn-red btn-sm',onClick:()=>setShowRej(sig)},'✕ Reject')
       )
@@ -3587,23 +3675,37 @@ function BrokerConnection({showToast}){
   const[manualDir,setManualDir]=useState('BUY');
   const[manualZar,setManualZar]=useState('');
   const[placing,setPlacing]=useState(false);
+  const[liveTrades,setLiveTrades]=useState([]);
+  const[closingId,setClosingId]=useState(null);
 
   const refresh=useCallback(async()=>{
     if(!window.ZuShePaperDB)return;
     try{
-      const[ks,fl,ord]=await Promise.all([
+      const[ks,fl,ord,lt]=await Promise.all([
         window.ZuShePaperDB.getTradeKeyStatus(),
         window.ZuShePaperDB.getSystemFlags(),
-        window.ZuShePaperDB.listLiveOrders().catch(()=>({orders:[]}))
+        window.ZuShePaperDB.listLiveOrders().catch(()=>({orders:[]})),
+        window.ZuShePaperDB.listLiveTrades().catch(()=>({trades:[]}))
       ]);
       setKeyStatus(ks);
       setFlags(fl);
       setCapInput(fl&&fl.max_live_order_zar?String(fl.max_live_order_zar):'');
       setOrders((ord&&ord.orders)||[]);
+      setLiveTrades((lt&&lt.trades)||[]);
     }catch(err){
       showToast&&showToast('Could not load broker status: '+(err?.message||err),'error');
     }
   },[showToast]);
+  const closeLiveTradeNow=async(t)=>{
+    if(!window.confirm('Close this LIVE position now at market price? This places a REAL sell order on Luno.'))return;
+    setClosingId(t.id);
+    try{
+      const res=await window.ZuShePaperDB.closeLiveTrade(t.id);
+      if(res&&res.error)showToast(res.error,'error');
+      else{showToast('Live position closed.','success');await refresh();}
+    }catch(err){showToast('Close failed: '+(err&&err.message||err),'error');}
+    setClosingId(null);
+  };
 
   useEffect(()=>{
     let cancelled=false,tries=0;
@@ -3767,7 +3869,28 @@ function BrokerConnection({showToast}){
         )
       ),
 
-      e('div',{style:{padding:'4px 4px 8px',fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2}},'RECENT LIVE ORDERS'),
+      e('div',{style:{padding:'4px 4px 8px',fontFamily:'var(--mono)',fontSize:9,color:'var(--red)',letterSpacing:2}},'LIVE POSITIONS (FROM SIGNALS · REAL MONEY)'),
+      liveTrades.length===0
+        ?e('div',{className:'empty'},
+            e('div',{className:'empty-icon'},'🔴'),
+            e('div',{className:'empty-title'},'No live signal trades yet'),
+            e('div',{className:'empty-sub'},'Tap ⚡ Accept — Trade LIVE on a BUY signal in Signal Desk (once armed above) to open one. It auto-closes at TP/SL, checked every minute.')
+          )
+        :liveTrades.map(t=>e('div',{key:t.id,className:'card',style:{padding:'10px 14px',border:'1px solid rgba(255,60,60,.25)'}},
+            e('div',{className:'row'},
+              e('span',{style:{fontWeight:700,fontSize:12}},'BUY '+t.pair+(t.strategy?' · '+t.strategy:'')),
+              e('span',{className:'pill',style:{background:t.status==='OPEN'?'rgba(0,229,204,.15)':t.status==='CLOSING'?'rgba(255,176,32,.15)':(Number(t.net_pnl)>=0?'rgba(0,200,120,.15)':'rgba(255,60,60,.15)')}},t.status)
+            ),
+            e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:4}},
+              'R'+Number(t.zar_amount||0).toFixed(2)+' at ~R'+Number(t.entry_price||0).toFixed(2)+' · TP R'+Number(t.take_profit||0).toFixed(2)+' · SL R'+Number(t.stop_price||0).toFixed(2)
+            ),
+            t.status==='CLOSED'&&e('div',{style:{fontSize:11,marginTop:4,color:Number(t.net_pnl)>=0?'var(--green)':'var(--red)'}},
+              (t.exit_reason||'Closed')+': '+(Number(t.net_pnl)>=0?'+':'')+'R'+Number(t.net_pnl).toFixed(2)+' net'
+            ),
+            t.status==='OPEN'&&e('div',{style:{marginTop:8}},e('button',{className:'btn btn-ghost btn-sm',disabled:closingId===t.id,onClick:()=>closeLiveTradeNow(t)},closingId===t.id?'Closing…':'Close Now (real order)'))
+          )),
+
+      e('div',{style:{padding:'4px 4px 8px',fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginTop:8}},'RECENT LIVE ORDERS'),
       orders.length===0
         ?e('div',{className:'empty'},
             e('div',{className:'empty-icon'},'🔌'),
@@ -5137,6 +5260,18 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
   // cannot skip them just because the client thinks it's ready.
   const zsPlaceLiveOrder = (pair, direction, zarAmount) => zsBrokerCall({ action: 'place', pair, direction, zar_amount: zarAmount });
   const zsListLiveOrders = () => zsBrokerCall({ action: 'list' });
+  // Signal -> REAL Luno order -> monitored close pipeline. Sizing (from
+  // stop distance + confidence), the BUY-only spot constraint, and every
+  // safety gate (kill switch, live_trading_enabled, order cap, real Luno
+  // balance check) all live server-side in broker-order — this call cannot
+  // skip any of them just because the client thinks it's ready.
+  const zsOpenLiveTrade = (sig) => zsBrokerCall({
+    action: 'open_signal', signal_id: sig.id, pair: sig.pair, direction: sig.dir,
+    entry_price: sig.entry, stop_price: sig.sl, take_profit: sig.tp,
+    confidence: sig.conf, strategy: sig.strat
+  });
+  const zsListLiveTrades = () => zsBrokerCall({ action: 'list_live_trades' });
+  const zsCloseLiveTrade = (id) => zsBrokerCall({ action: 'close_live', id });
 
   async function zsPersistAccount(patch) {
     const db = zsInitSupabase();
@@ -5282,7 +5417,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     clearTradeKey: zsClearTradeKey,
     updateSystemFlags: zsUpdateSystemFlags,
     placeLiveOrder: zsPlaceLiveOrder,
-    listLiveOrders: zsListLiveOrders
+    listLiveOrders: zsListLiveOrders,
+    openLiveTrade: zsOpenLiveTrade,
+    listLiveTrades: zsListLiveTrades,
+    closeLiveTrade: zsCloseLiveTrade
   };
 
   window.addEventListener('load', async () => {
