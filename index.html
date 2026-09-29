@@ -3027,12 +3027,21 @@ function BacktestArena({strategies}){
   const[showExplain,setShowExplain]=useState(false);
 
   const[btNotice,setBtNotice]=useState('');
-  const runBacktest=async()=>{
-    // No fabricated results: this arena must not show performance until it is
-    // wired to real historical candles (walk-forward, no look-ahead).
-    setResult(null);
-    setBtNotice('Backtest engine is not connected to real historical candles yet, so no result is shown. Fake/random results were removed.');
+  const[wfRuns,setWfRuns]=useState(null);
+  // Real results only: walk-forward runs are produced automatically every day by the
+  // backtest-runner Edge Function on real Luno candles and stored in Supabase.
+  const loadWf=async()=>{
+    setRunning(true);setBtNotice('');
+    try{
+      const rows=await window.ZuShePaperDB?.loadBacktestRuns?.();
+      setWfRuns(rows||[]);
+      if(!rows||!rows.length)setBtNotice('No completed walk-forward runs yet. They are generated automatically every day; check back after the next scheduled run.');
+    }catch(err){setWfRuns([]);setBtNotice('Could not load stored backtest runs: '+(err?.message||'network error'));}
+    finally{setRunning(false);}
   };
+  useEffect(()=>{loadWf();},[]);
+  const runBacktest=loadWf;
+  const tfLabel=s=>({300:'M5',900:'M15',1800:'M30',3600:'H1',14400:'H4'}[Number(s)]||(Number(s)/60)+'m');
 
   return e('div',{className:'screen'},
     e('div',{className:'hdr'},
@@ -3092,11 +3101,42 @@ function BacktestArena({strategies}){
         e('button',{className:'btn btn-primary',onClick:runBacktest,disabled:running},
           running
             ?e('span',{style:{display:'flex',alignItems:'center',gap:8}},e('div',{className:'spinner'}),'Replaying '+period+' of price history...')
-            :'▶ Run Backtest Now'
+            :'↻ Refresh Automatic Results'
         )
       ),
 
       btNotice&&e('div',{className:'warn-banner'},e('div',{className:'warn-icon'},'⚠️'),e('div',{className:'warn-text'},btNotice)),
+
+      // Automatic walk-forward results (real candles, out-of-sample folds, fees included)
+      wfRuns&&wfRuns.length>0&&e('div',{className:'card'},
+        e('div',{style:{fontFamily:'var(--mono)',fontSize:9,color:'var(--cyan)',letterSpacing:2,marginBottom:6}},'AUTOMATIC WALK-FORWARD RESULTS'),
+        e('div',{style:{fontSize:11,color:'var(--text3)',marginBottom:10,lineHeight:1.5}},'Run daily on real Luno history with time-ordered out-of-sample folds. Nothing here is simulated randomly. Small samples are flagged and should not be trusted.'),
+        wfRuns.map(r=>{
+          const o=(r.summary&&r.summary.overall)||{};
+          const strats=Object.entries((r.summary&&r.summary.strategies)||{});
+          const pf=o.profitFactor,ex=o.expectancyR;
+          const col=(ex||0)>0?'var(--green)':'var(--red)';
+          return e('div',{key:r.run_id,style:{background:'var(--glass)',borderRadius:8,padding:'10px',marginBottom:8}},
+            e('div',{className:'row',style:{marginBottom:6}},
+              e('div',{style:{fontWeight:700,fontSize:13}},(r.params&&r.params.pair)+' · '+tfLabel(r.params&&r.params.timeframe)),
+              e('div',{style:{fontSize:9,color:'var(--text3)',fontFamily:'var(--mono)'}},new Date(r.created_at).toLocaleString())
+            ),
+            e('div',{style:{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:6,fontFamily:'var(--mono)',fontSize:11}},
+              e('div',null,e('div',{style:{fontWeight:700}},o.n!=null?o.n:'—'),e('div',{style:{fontSize:8,color:'var(--text3)'}},'TRADES')),
+              e('div',null,e('div',{style:{fontWeight:700,color:col}},ex!=null?ex+'R':'—'),e('div',{style:{fontSize:8,color:'var(--text3)'}},'EXPECTANCY')),
+              e('div',null,e('div',{style:{fontWeight:700}},pf!=null?pf:'—'),e('div',{style:{fontSize:8,color:'var(--text3)'}},'PROFIT FACTOR')),
+              e('div',null,e('div',{style:{fontWeight:700,color:'var(--amber)'}},o.maxDrawdownR!=null?o.maxDrawdownR+'R':'—'),e('div',{style:{fontSize:8,color:'var(--text3)'}},'MAX DD'))
+            ),
+            (o.n!=null&&o.n<30)&&e('div',{style:{fontSize:10,color:'var(--amber)',marginTop:6}},'Under 30 trades: statistically unreliable.'),
+            strats.length>0&&e('div',{style:{marginTop:8,fontSize:10,color:'var(--text3)',fontFamily:'var(--mono)'}},
+              strats.map(([name,rep])=>e('div',{key:name,style:{display:'flex',justifyContent:'space-between',padding:'2px 0'}},
+                e('span',null,name),
+                e('span',null,'n='+((rep.combined&&rep.combined.n)||0)+' · '+((rep.combined&&rep.combined.expectancyR!=null)?rep.combined.expectancyR+'R':'—')+' · folds '+(rep.consistentAcrossFolds===true?'consistent':rep.consistentAcrossFolds===false?'inconsistent':'n/a'))
+              ))
+            )
+          );
+        })
+      ),
 
       // Results
       result&&e('div',null,
@@ -5158,6 +5198,23 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
   }
 
   // Rebuilds balance/equity/realized/daily P&L from the sum of every closed trade. Idempotent.
+  // Latest COMPLETE walk-forward run per pair+timeframe, written automatically by the
+  // backtest-runner Edge Function (pg_cron, daily). Read-only: the browser never fabricates results.
+  async function zsLoadBacktestRuns() {
+    const db = zsInitSupabase();
+    if (!db) return [];
+    const { data, error } = await db.from('trader_backtest_runs')
+      .select('run_id,created_at,status,params,coverage,summary')
+      .eq('status', 'complete').order('created_at', { ascending: false }).limit(60);
+    if (error) throw error;
+    const seen = {}, out = [];
+    for (const r of data || []) {
+      const k = (r.params && r.params.pair) + ':' + (r.params && r.params.timeframe);
+      if (seen[k]) continue; seen[k] = 1; out.push(r);
+    }
+    return out;
+  }
+
   async function zsRecomputeAccount() {
     const db = zsInitSupabase();
     if (!db) return null;
@@ -5463,6 +5520,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     loadClosedTradesForGate: zsLoadClosedTradesForGate,
     openTrade: zsOpenTrade,
     closeTrade: zsCloseTrade,
+    loadBacktestRuns: zsLoadBacktestRuns,
     loadSignals: zsLoadSignals,
     decideSignal: zsDecideSignal,
     deleteSignals: zsDeleteSignals,
