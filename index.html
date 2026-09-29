@@ -878,6 +878,9 @@ function createPaperPosition(signal,balance,riskSettings){
 // returns the real exit price and outcome — never a randomised result.
 function evaluatePaperExit(pos,lastPrice){
   if(!pos||!Number.isFinite(lastPrice)||lastPrice<=0)return null;
+  // Server-managed trades (breakeven / scale-out / early decay) are closed only by paper-exit-check, which knows the
+  // moving stop and the scaled quantity. Closing here at the initial stop would be wrong.
+  if(pos.mgmt)return null;
   // Past its max holding time: leave it to the server's paper-exit-check, which books TIME_WIN / TIME_LOSS at the real market price.
   if(pos.maxHold&&pos.openedAt&&Date.now()>=pos.openedAt+pos.maxHold*60000)return null;
   if(pos.dir==='BUY'){
@@ -1482,7 +1485,7 @@ function Dashboard({account,setAccount,signals,strategies,showToast,setScreen,li
 // Horizon / hold-time metadata a signal carries into the paper trade so the
 // server-side paper-exit-check can enforce the time exit (TIME_WIN / TIME_LOSS).
 function zsSigTradeMeta(sig){
-  return {tfSec:sig.tfSec||null,horizon:sig.horizon||'SWING',maxHold:sig.maxHold||null,assetClass:sig.assetClass||'CRYPTO',provider:sig.provider||'luno',regime:sig.regime||null,quality:sig.quality!=null?sig.quality:null};
+  return {mgmt:true,tfSec:sig.tfSec||null,horizon:sig.horizon||'SWING',maxHold:sig.maxHold||null,assetClass:sig.assetClass||'CRYPTO',provider:sig.provider||'luno',regime:sig.regime||null,quality:sig.quality!=null?sig.quality:null};
 }
 // A short-horizon signal's entry price goes stale quickly; the scanner expires them server-side too.
 function zsSigFresh(sig){
@@ -1515,7 +1518,8 @@ function zsFmtDuration(ms){
 function zsExitBucket(t){
   const trig=String(t.trigger||'').toLowerCase();
   if(trig==='take-profit'||trig.includes('take-profit'))return 'tp';
-  if(trig==='stop-loss'||trig.includes('stop-loss'))return 'sl';
+  if(trig==='stop-loss'||trig.includes('stop-loss')||trig==='breakeven-stop')return 'sl';
+  if(trig==='early-decay')return 'time';
   if(trig==='time_win'||trig==='time_loss')return 'time';
   return 'manual';
 }
@@ -1531,7 +1535,15 @@ function zsSettleClose(trade,setAccount){
   }).catch(err=>console.warn('[ZuShé Trader] settle close failed:',err?.message||err));
 }
 function zsRowToPos(t){
-  return {id:'PT-'+String(t.id).slice(0,8),dbId:t.id,pair:t.pair,market:zsPairAsset(t.pair),dir:t.direction,entry:Number(t.entry_price),sl:Number(t.stop_price),tp:Number(t.take_profit),size:Number(t.quantity),risk:Number(t.risk_amount),strategy:t.strategy,strat:t.strategy,confidence:Number(t.metadata&&t.metadata.confidence)||0,openedAt:Date.parse(t.entry_time)||Date.now(),paper:true,horizon:t.horizon||'SWING',tfSec:Number(t.timeframe)||null,maxHold:t.max_hold_minutes?Number(t.max_hold_minutes):null,regime:t.regime||null};
+  // Trade management (breakeven / 50% scale-out) is done server-side by paper-exit-check. After a scale-out the
+  // open position is only the REMAINING quantity, and the locked-in partial P&L is carried so a manual close still
+  // books the whole trade correctly.
+  const sc=t.scaled_out===true&&Number(t.scale_qty)>0;
+  const sQty=sc?Number(t.scale_qty):0,sPx=sc?Number(t.scale_price):0,ent=Number(t.entry_price);
+  const dirSign=t.direction==='BUY'?1:-1;
+  const partialGross=sc?Number((dirSign*(sPx-ent)*sQty).toFixed(2)):0;
+  const partialFee=sc?Number(((ent*sQty+sPx*sQty)*0.001).toFixed(2)):0;
+  return {mgmt:t.mgmt_enabled===true,activeStop:t.active_stop!=null?Number(t.active_stop):null,beActive:t.be_active===true,scaledOut:sc,partialGross,partialFee,partialNet:sc?Number((partialGross-partialFee).toFixed(2)):0,id:'PT-'+String(t.id).slice(0,8),dbId:t.id,pair:t.pair,market:zsPairAsset(t.pair),dir:t.direction,entry:Number(t.entry_price),sl:Number(t.stop_price),tp:Number(t.take_profit),size:Number(t.quantity)-sQty,risk:Number(t.risk_amount),strategy:t.strategy,strat:t.strategy,confidence:Number(t.metadata&&t.metadata.confidence)||0,openedAt:Date.parse(t.entry_time)||Date.now(),paper:true,horizon:t.horizon||'SWING',tfSec:Number(t.timeframe)||null,maxHold:t.max_hold_minutes?Number(t.max_hold_minutes):null,regime:t.regime||null};
 }
 function zsRowToClosed(t){
   const pl=Number(t.net_pnl)||0;
@@ -4898,15 +4910,19 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
   async function zsSaveLunoKey(keyId, keySecret) {
     const db = zsInitSupabase();
     if (!db) throw new Error('Supabase not available');
-    const { error } = await db
-      .from('trader_system_flags')
-      .upsert({
-        owner_key: ZS_SYSTEM_KEY,
-        luno_key_id: keyId ? String(keyId).trim() : null,
-        luno_key_secret: keySecret ? String(keySecret).trim() : null,
-        luno_key_updated_at: new Date().toISOString()
-      }, { onConflict: 'owner_key' });
+    // The secret column is write-only for the browser (no SELECT grant), and an upsert's ON CONFLICT DO UPDATE
+    // would need to read it, so update the existing row and only insert if it does not exist yet.
+    const patch = {
+      luno_key_id: keyId ? String(keyId).trim() : null,
+      luno_key_secret: keySecret ? String(keySecret).trim() : null,
+      luno_key_updated_at: new Date().toISOString()
+    };
+    const { data: upd, error } = await db.from('trader_system_flags').update(patch).eq('owner_key', ZS_SYSTEM_KEY).select('owner_key');
     if (error) throw error;
+    if (!upd || upd.length === 0) {
+      const { error: insErr } = await db.from('trader_system_flags').insert({ owner_key: ZS_SYSTEM_KEY, ...patch });
+      if (insErr) throw insErr;
+    }
   }
 
   async function zsSaveCandles(candles) {
@@ -5168,9 +5184,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
   async function zsCloseTrade(trade) {
     const db = zsInitSupabase();
     if (!db || !trade || !trade.dbId) return;
-    const pl = Number(trade.pl || 0);
-    const grossPl = trade.grossPl != null ? Number(trade.grossPl) : pl;
-    const fee = Number(trade.fee || 0);
+    const pNet = Number(trade.partialNet || 0), pGross = Number(trade.partialGross || 0), pFee = Number(trade.partialFee || 0);
+    const pl = Number((Number(trade.pl || 0) + pNet).toFixed(2));
+    const grossPl = Number(((trade.grossPl != null ? Number(trade.grossPl) : Number(trade.pl || 0)) + pGross).toFixed(2));
+    const fee = Number((Number(trade.fee || 0) + pFee).toFixed(2));
     const slip = Number(trade.slip || 0);
     const payload = {
       status: 'CLOSED',
