@@ -3846,9 +3846,11 @@ function BrokerConnection({showToast}){
   const saveCap=async()=>{
     const v=Number(capInput);
     if(!Number.isFinite(v)||v<0){showToast('Enter a valid ZAR amount (0 to disable)','warning');return;}
+    let pin='';
+    if(v>0){pin=window.prompt('Enter your PIN to change the live order cap');if(pin===null)return;}
     setSavingCap(true);
     try{
-      await window.ZuShePaperDB.updateSystemFlags({max_live_order_zar:v});
+      await window.ZuShePaperDB.flagsCall({action:'set_cap',value:v,pin});
       showToast(v>0?'Max live order size saved':'Live orders disabled (cap set to 0)','success');
       await refresh();
     }catch(err){showToast('Could not save: '+(err?.message||err),'error');}
@@ -3862,9 +3864,11 @@ function BrokerConnection({showToast}){
       if(confirmText.trim().toUpperCase()!=='ENABLE LIVE TRADING'){showToast('Type the confirmation phrase exactly to enable live trading','warning');return;}
       if(!window.confirm('This allows real orders to be placed on your Luno account (up to your max order size, one at a time, only when you tap Place Order below). Continue?'))return;
     }
+    let pin='';
+    if(turnOn){pin=window.prompt('Enter your PIN to enable live trading');if(pin===null)return;}
     setTogglingLive(true);
     try{
-      await window.ZuShePaperDB.updateSystemFlags({live_trading_enabled:turnOn,live_trading_confirmed_at:turnOn?new Date().toISOString():null});
+      await window.ZuShePaperDB.flagsCall({action:'set_live',enabled:turnOn,pin});
       showToast(turnOn?'Live trading enabled':'Live trading disabled','success');
       setConfirmText('');
       await refresh();
@@ -3939,6 +3943,12 @@ function BrokerConnection({showToast}){
           e('input',{className:'inp',type:'number',placeholder:'0',value:capInput,onChange:ev=>setCapInput(ev.target.value),style:{flex:1}}),
           e('button',{className:'btn btn-ghost',onClick:saveCap,disabled:savingCap},savingCap?'Saving...':'Save')
         ),
+        e('button',{className:'btn btn-ghost',style:{marginTop:8,fontSize:11},onClick:async()=>{
+          const oldPin=window.prompt('Current PIN');if(oldPin===null)return;
+          const newPin=window.prompt('New PIN (6 to 32 characters)');if(newPin===null)return;
+          try{await window.ZuShePaperDB.flagsCall({action:'change_pin',pin:oldPin,new_pin:newPin});showToast('PIN changed','success');}
+          catch(err){showToast('Could not change PIN: '+(err?.message||err),'error');}
+        }},'Change PIN'),
         flags&&e('div',{style:{fontSize:11,color:'var(--text3)',marginTop:8}},'Current cap: R'+(Number(flags.max_live_order_zar)||0).toFixed(2))
       ),
 
@@ -5387,9 +5397,24 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
   async function zsUpdateSystemFlags(patch) {
     const db = zsInitSupabase();
     if (!db) throw new Error('Supabase not available');
+    // Live switches are PIN-locked server-side (flags-update). Direct writes to them are refused by the database.
+    const LOCKED = ['live_trading_enabled','live_trading_confirmed_at','max_live_order_zar','kill_switch_active','kill_switch_activated_at','live_risk_mode','live_risk_fixed_zar','live_risk_percent','admin_max_risk_pct'];
+    if (Object.keys(patch || {}).some(k => LOCKED.includes(k))) throw new Error('This setting is PIN-protected. Use the PIN-gated action instead.');
     const { error } = await db.from('trader_system_flags')
       .upsert({ owner_key: ZS_SYSTEM_KEY, ...patch }, { onConflict: 'owner_key' });
     if (error) throw error;
+  }
+
+  // PIN-gated writes for the live-trading switches (kill switch, live toggle, order cap, risk fields).
+  async function zsFlagsCall(payload) {
+    const res = await fetch(`${ZS_SUPABASE_URL}/functions/v1/flags-update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok || j.error) throw new Error(j.error || ('HTTP ' + res.status));
+    return j;
   }
 
   async function zsBrokerCall(payload) {
@@ -5564,6 +5589,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     getTradeKeyStatus: zsGetTradeKeyStatus,
     clearTradeKey: zsClearTradeKey,
     updateSystemFlags: zsUpdateSystemFlags,
+    flagsCall: zsFlagsCall,
     placeLiveOrder: zsPlaceLiveOrder,
     listLiveOrders: zsListLiveOrders,
     openLiveTrade: zsOpenLiveTrade,
