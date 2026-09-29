@@ -2464,12 +2464,8 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
       pl=parseFloat((grossPl-fee).toFixed(2));
       status=pl>=0?'Win':'Loss';
     }else{
-      // Demo/simulated position from the illustrative signal desk — clearly
-      // labelled DEMO MODE elsewhere in the app, not the real paper engine.
-      pl=parseFloat(((Math.random()>.45?1:-1)*pos.risk*(1+Math.random()*2)).toFixed(2));
-      exitPrice=pos.dir==='BUY'?pos.entry*(1+(pl>0?.008:-.005)):pos.entry*(1-(pl>0?.008:-.005));
-      grossPl=pl;fee=0;
-      status=pl>0?'Win':'Loss';
+      // Demo positions have no real price path. Never invent an outcome.
+      showToast('This is a demo position with no real market data, so it cannot be closed with a simulated result.','warning');return;
     }
     const trade={...pos,exit:parseFloat(exitPrice.toFixed(pos.entry<10?4:2)),pl,grossPl,fee,slip:0,closeTime:new Date().toISOString(),status,trigger:pos.paper?'Manual close':undefined};
     const newBalance=parseFloat((account.balance+pl).toFixed(2));
@@ -3030,30 +3026,12 @@ function BacktestArena({strategies}){
   const[result,setResult]=useState(null);
   const[showExplain,setShowExplain]=useState(false);
 
+  const[btNotice,setBtNotice]=useState('');
   const runBacktest=async()=>{
-    setRunning(true);setResult(null);
-    await new Promise(r=>setTimeout(r,1800));
-    const s=strategies.find(x=>x.id===selStrat)||strategies[0];
-    const wr=s?s.winRate:55;
-    const pf=s?s.pf:1.5;
-    const dd=s?s.dd:10;
-    const trades=s?s.trades:80;
-    const ret=parseFloat(((pf-1)*wr*0.8).toFixed(2));
-    const startBal=1000;
-    const endBal=Math.round(startBal*(1+ret/100));
-    const equity=[startBal];
-    for(let i=0;i<20;i++){const v=equity[i]*(1+(Math.random()>.45?.013:-.009));equity.push(Math.round(v));}
-    const totalProfit=ret>0?endBal-startBal:0;
-    const totalLoss=ret<0?startBal-endBal:Math.round((endBal-startBal)*(.3+Math.random()*.2));
-    const isOverfit=dd<8&&wr>68;
-    setResult({ret,startBal,endBal,wr,lr:100-wr,pf:pf.toFixed(2),dd:dd.toFixed(1),trades,
-      avgDur:'3h 45m',best:320,worst:-180,overfit:isOverfit?'High':'Low',
-      rating:s?scoreLabel(s.score):'Promising',equity,
-      monthly:[3.2,-1.1,4.5,2.8,-0.9,5.1],
-      longWR:wr+3,shortWR:wr-3,
-      totalProfit,totalLoss,
-      pfExplain:totalLoss>0?(totalProfit/totalLoss).toFixed(2):pf.toFixed(2)});
-    setRunning(false);
+    // No fabricated results: this arena must not show performance until it is
+    // wired to real historical candles (walk-forward, no look-ahead).
+    setResult(null);
+    setBtNotice('Backtest engine is not connected to real historical candles yet, so no result is shown. Fake/random results were removed.');
   };
 
   return e('div',{className:'screen'},
@@ -3117,6 +3095,8 @@ function BacktestArena({strategies}){
             :'▶ Run Backtest Now'
         )
       ),
+
+      btNotice&&e('div',{className:'warn-banner'},e('div',{className:'warn-icon'},'⚠️'),e('div',{className:'warn-text'},btNotice)),
 
       // Results
       result&&e('div',null,
@@ -4861,7 +4841,8 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     if (!db) return null;
     const { data, error } = await db
       .from('trader_system_flags')
-      .select('*')
+      // Explicit columns: the Luno key SECRET is write-only from the browser and must never be read back.
+      .select('owner_key,kill_switch_active,kill_switch_activated_at,live_trading_enabled,admin_max_risk_pct,evolution_engine_enabled,updated_at,luno_key_id,luno_key_updated_at,max_live_order_zar,live_trading_confirmed_at,live_risk_mode,live_risk_fixed_zar,live_risk_percent,stats_reset_at,evolution_stats_reset_at')
       .eq('owner_key', ZS_SYSTEM_KEY)
       .maybeSingle();
     if (error) throw error;
@@ -5165,8 +5146,15 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     if (ent > 0 && ex > 0 && Math.abs(ex / ent - 1) > 0.5) {
       throw new Error('Refusing to save a close price more than 50% away from entry (' + ex + ' vs ' + ent + ')');
     }
-    const { error } = await db.from('trader_paper_trades').update(payload).eq('id', trade.dbId);
+    // Idempotent + race-safe: only an OPEN row can be finalised, so a second
+    // close (SL/TP/manual/time racing each other) can never overwrite the first.
+    const { data: upd, error } = await db.from('trader_paper_trades').update(payload).eq('id', trade.dbId).eq('status', 'OPEN').select('id');
     if (error) { console.warn('[ZuShé Trader] closeTrade failed:', error.message || error); throw error; }
+    if (!upd || upd.length === 0) {
+      console.info('[ZuShé Trader] closeTrade skipped: trade already closed', trade.dbId);
+      return { alreadyClosed: true };
+    }
+    return { alreadyClosed: false };
   }
 
   // Rebuilds balance/equity/realized/daily P&L from the sum of every closed trade. Idempotent.
