@@ -1488,6 +1488,16 @@ function zsSigTradeMeta(sig){
   return {mgmt:true,tfSec:sig.tfSec||null,horizon:sig.horizon||'SWING',maxHold:sig.maxHold||null,assetClass:sig.assetClass||'CRYPTO',provider:sig.provider||'luno',regime:sig.regime||null,quality:sig.quality!=null?sig.quality:null};
 }
 // A short-horizon signal's entry price goes stale quickly; the scanner expires them server-side too.
+// Duplicate-bet guard: a second position on the same pair+direction is only allowed for very high confidence
+// (>= ZS_DUP_MIN_CONF), and never more than ZS_DUP_MAX per pair+direction. Stops one idea being opened 3x.
+const ZS_DUP_MIN_CONF=85,ZS_DUP_MAX=2;
+function zsDupBlocked(openList,sig,pendingChosen){
+  const same=(openList||[]).filter(p=>p.paper&&p.pair===sig.pair&&p.dir===sig.dir).length+(pendingChosen||[]).filter(c=>c.pair===sig.pair&&c.dir===sig.dir).length;
+  if(same===0)return null;
+  if(same>=ZS_DUP_MAX)return 'You already have '+same+' '+sig.dir+' positions on '+sig.pair+' (max '+ZS_DUP_MAX+').';
+  if((sig.conf||0)<ZS_DUP_MIN_CONF)return 'You already have a '+sig.dir+' on '+sig.pair+'. A second one needs at least '+ZS_DUP_MIN_CONF+'% confidence (this is '+(sig.conf||0)+'%).';
+  return null;
+}
 function zsSigFresh(sig){
   if(!sig||!sig.maxHold||!sig.createdMs)return true;
   return (Date.now()-sig.createdMs)<=(sig.horizon==='SCALP'?10:45)*60000;
@@ -1543,7 +1553,7 @@ function zsRowToPos(t){
   const dirSign=t.direction==='BUY'?1:-1;
   const partialGross=sc?Number((dirSign*(sPx-ent)*sQty).toFixed(2)):0;
   const partialFee=sc?Number(((ent*sQty+sPx*sQty)*0.001).toFixed(2)):0;
-  return {mgmt:t.mgmt_enabled===true,activeStop:t.active_stop!=null?Number(t.active_stop):null,beActive:t.be_active===true,scaledOut:sc,partialGross,partialFee,partialNet:sc?Number((partialGross-partialFee).toFixed(2)):0,id:'PT-'+String(t.id).slice(0,8),dbId:t.id,pair:t.pair,market:zsPairAsset(t.pair),dir:t.direction,entry:Number(t.entry_price),sl:Number(t.stop_price),tp:Number(t.take_profit),size:Number(t.quantity)-sQty,risk:Number(t.risk_amount),strategy:t.strategy,strat:t.strategy,confidence:Number(t.metadata&&t.metadata.confidence)||0,openedAt:Date.parse(t.entry_time)||Date.now(),paper:true,horizon:t.horizon||'SWING',tfSec:Number(t.timeframe)||null,maxHold:t.max_hold_minutes?Number(t.max_hold_minutes):null,regime:t.regime||null};
+  return {sigId:(t.metadata&&t.metadata.sig_id)||null,mgmt:t.mgmt_enabled===true,activeStop:t.active_stop!=null?Number(t.active_stop):null,beActive:t.be_active===true,scaledOut:sc,partialGross,partialFee,partialNet:sc?Number((partialGross-partialFee).toFixed(2)):0,id:'PT-'+String(t.id).slice(0,8),dbId:t.id,pair:t.pair,market:zsPairAsset(t.pair),dir:t.direction,entry:Number(t.entry_price),sl:Number(t.stop_price),tp:Number(t.take_profit),size:Number(t.quantity)-sQty,risk:Number(t.risk_amount),strategy:t.strategy,strat:t.strategy,confidence:Number(t.metadata&&t.metadata.confidence)||0,openedAt:Date.parse(t.entry_time)||Date.now(),paper:true,horizon:t.horizon||'SWING',tfSec:Number(t.timeframe)||null,maxHold:t.max_hold_minutes?Number(t.max_hold_minutes):null,regime:t.regime||null};
 }
 function zsRowToClosed(t){
   const pl=Number(t.net_pnl)||0;
@@ -1778,6 +1788,8 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     // 66% signal) through even with Risk Vault's Min Confidence set to 72.
     const minConf=Number.isFinite(Number(riskSettings.minConfidence))?Number(riskSettings.minConfidence):0;
     if((sig.conf||0)<minConf){showToast('This signal is '+(sig.conf||0)+'% confidence, below your Min Confidence gate ('+minConf+'%) in Risk Vault. Lower it there if you want to accept weaker setups.','warning');return;}
+    const dup=zsDupBlocked(account.openPositions,sig,[]);
+    if(dup){showToast(dup,'warning');return;}
     const stats=paperLoad(PAPER_LS.stats,{dailyLoss:0,lossStreak:0,totalPnL:0});
     const gate=paperRiskAllowed(stats,account,riskSettings,{pair:sig.pair,strategy:sig.strat});
     if(!gate.ok){showToast(gate.reason,'warning');return;}
@@ -1821,7 +1833,7 @@ function SignalDesk({signals,setSignals,account,setAccount,showToast,riskSetting
     for(const sig of qualified){
       if(chosen.length>=room)break;
       const mCount=marketCount[sig.pair]||0,sCount=stratCount[sig.strat]||0;
-      if(mCount>=maxPerMarket||sCount>=maxPerStrategy){skippedConcentration++;continue;}
+      if(mCount>=maxPerMarket||sCount>=maxPerStrategy||zsDupBlocked(account.openPositions,sig,chosen)){skippedConcentration++;continue;}
       chosen.push(sig);
       marketCount[sig.pair]=mCount+1;
       stratCount[sig.strat]=sCount+1;
@@ -2583,6 +2595,7 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
   // A titled section for one closed-trade bucket: subtotal header (count,
   // win rate, net P/L) followed by that bucket's cards, oldest-excluded —
   // account.closedTrades already comes sorted newest-first.
+  const[closedSub,setClosedSub]=useState('all');
   const renderClosedGroup=(key,icon,title,sub,list,bucket,emptyMsg)=>{
     const s=groupStats(list);
     return e('div',{key},
@@ -2763,10 +2776,14 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
               e('div',{className:'empty-sub'},'Closed trades appear here. Accept a signal from the Signal Desk, then close the position to see your first result.')
             )
           :e('div',null,
-              renderClosedGroup('tp','🎯','Take-Profit Hits','Auto-closed at your target price',tpTrades,'tp','No trades have hit Take-Profit yet.'),
-              renderClosedGroup('sl','🛑','Stop-Loss Hits','Auto-closed to limit the loss',slTrades,'sl','No trades have hit Stop-Loss yet.'),
-              renderClosedGroup('time','⏱','Time Exits','Closed at the max holding time using the real market price (TIME_WIN / TIME_LOSS)',timeTrades,'time','No time exits yet.'),
-              renderClosedGroup('manual','✋','Manually Closed','You closed these by hand before TP/SL',manualTrades,'manual','No manual closes yet.')
+              e('div',{className:'tabs',style:{marginBottom:6}},
+                [['all','All',account.closedTrades.length],['tp','TP',tpTrades.length],['sl','SL',slTrades.length],['manual','Manual',manualTrades.length],['time','Time',timeTrades.length]]
+                  .map(([id,l,n])=>e('button',{key:id,className:'tab '+(closedSub===id?'on':''),onClick:()=>setClosedSub(id)},l+' ('+n+')'))
+              ),
+              (closedSub==='all'||closedSub==='tp')&&renderClosedGroup('tp','🎯','Take-Profit Hits','Auto-closed at your target price',tpTrades,'tp','No trades have hit Take-Profit yet.'),
+              (closedSub==='all'||closedSub==='sl')&&renderClosedGroup('sl','🛑','Stop-Loss Hits','Auto-closed to limit the loss',slTrades,'sl','No trades have hit Stop-Loss yet.'),
+              (closedSub==='all'||closedSub==='time')&&renderClosedGroup('time','⏱','Time Exits','Closed at the max holding time using the real market price (TIME_WIN / TIME_LOSS)',timeTrades,'time','No time exits yet.'),
+              (closedSub==='all'||closedSub==='manual')&&renderClosedGroup('manual','✋','Manually Closed','You closed these by hand before TP/SL',manualTrades,'manual','No manual closes yet.')
             )
       ),
 
@@ -4682,7 +4699,8 @@ function App(){
         const serverOpen=openRows.map(t=>{const p=byDb[t.id];return p?{...p,market:p.market||zsPairAsset(p.pair),strat:p.strat||p.strategy}:zsRowToPos(t);});
         const recent=Date.now()-2*60*1000;
         const keepLocal=localOpen.filter(p=>{
-          if(!p.paper||!p.dbId)return true; // demo / legacy positions are left alone
+          if(p.paper&&!p.dbId)return false; // paper trade never saved to the server: not a real position
+          if(!p.paper)return true; // true demo positions are left alone
           if(openIds.has(p.dbId))return false;          // already taken from the server list
           if(closedAll.some(t=>t.id===p.dbId))return false; // closed or voided on the server
           return !complete||(p.openedAt||0)>recent;     // unknown to server: keep only if too new / list incomplete
@@ -5185,7 +5203,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
       regime: trade.regime || null,
       quality_score: trade.quality != null ? Number(trade.quality) : null,
       entry_time: new Date(trade.openedAt || Date.now()).toISOString(),
-      metadata: { local_id: trade.id, confidence: Number(trade.confidence || 0), max_hold_minutes: trade.maxHold ? Number(trade.maxHold) : null }
+      metadata: { sig_id: trade.sigId || null, local_id: trade.id, confidence: Number(trade.confidence || 0), max_hold_minutes: trade.maxHold ? Number(trade.maxHold) : null }
     };
     const { error } = await db.from('trader_paper_trades').insert(payload);
     if (error) console.warn('[ZuShé Trader] openTrade failed:', error.message || error);
