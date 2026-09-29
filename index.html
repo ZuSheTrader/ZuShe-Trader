@@ -1488,14 +1488,12 @@ function zsSigTradeMeta(sig){
   return {mgmt:true,tfSec:sig.tfSec||null,horizon:sig.horizon||'SWING',maxHold:sig.maxHold||null,assetClass:sig.assetClass||'CRYPTO',provider:sig.provider||'luno',regime:sig.regime||null,quality:sig.quality!=null?sig.quality:null};
 }
 // A short-horizon signal's entry price goes stale quickly; the scanner expires them server-side too.
-// Duplicate-bet guard: a second position on the same pair+direction is only allowed for very high confidence
-// (>= ZS_DUP_MIN_CONF), and never more than ZS_DUP_MAX per pair+direction. Stops one idea being opened 3x.
-const ZS_DUP_MIN_CONF=85,ZS_DUP_MAX=2;
+// Duplicate-bet guard: ONE open position per pair+direction. Confidence is deliberately not an exception
+// (measured: 80+ confidence trades won 10%, under 60 won 31%). Stops one idea being opened several times.
+const ZS_DUP_MAX=1;
 function zsDupBlocked(openList,sig,pendingChosen){
   const same=(openList||[]).filter(p=>p.paper&&p.pair===sig.pair&&p.dir===sig.dir).length+(pendingChosen||[]).filter(c=>c.pair===sig.pair&&c.dir===sig.dir).length;
-  if(same===0)return null;
-  if(same>=ZS_DUP_MAX)return 'You already have '+same+' '+sig.dir+' positions on '+sig.pair+' (max '+ZS_DUP_MAX+').';
-  if((sig.conf||0)<ZS_DUP_MIN_CONF)return 'You already have a '+sig.dir+' on '+sig.pair+'. A second one needs at least '+ZS_DUP_MIN_CONF+'% confidence (this is '+(sig.conf||0)+'%).';
+  if(same>=ZS_DUP_MAX)return 'You already have a '+sig.dir+' on '+sig.pair+'. One position per pair and direction (confidence does not override this: high-confidence signals have won least so far).';
   return null;
 }
 function zsSigFresh(sig){
