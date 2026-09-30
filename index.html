@@ -2513,7 +2513,8 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
   // Split closed trades into the groups the Closed Trades tab shows separately:
   // hit Take-Profit, hit Stop-Loss, or closed by hand (manual / anything else).
   const tpTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='tp'),[account.closedTrades]);
-  const slTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='sl'),[account.closedTrades]);
+  const slTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='sl'&&String(t.trigger||'').toLowerCase()!=='breakeven-stop'),[account.closedTrades]);
+  const beTrades=useMemo(()=>account.closedTrades.filter(t=>String(t.trigger||'').toLowerCase()==='breakeven-stop'),[account.closedTrades]);
   const manualTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='manual'),[account.closedTrades]);
   const timeTrades=useMemo(()=>account.closedTrades.filter(t=>zsExitBucket(t)==='time'),[account.closedTrades]);
   const groupStats=(list)=>{
@@ -2775,11 +2776,12 @@ function Portfolio({account,setAccount,showToast,liveEquity,unrealizedTotal,live
             )
           :e('div',null,
               e('div',{className:'tabs',style:{marginBottom:6}},
-                [['all','All',account.closedTrades.length],['tp','TP',tpTrades.length],['sl','SL',slTrades.length],['manual','Manual',manualTrades.length],['time','Time',timeTrades.length]]
+                [['all','All',account.closedTrades.length],['tp','TP',tpTrades.length],['sl','SL',slTrades.length],['be','BE',beTrades.length],['manual','Manual',manualTrades.length],['time','Time',timeTrades.length]]
                   .map(([id,l,n])=>e('button',{key:id,className:'tab '+(closedSub===id?'on':''),onClick:()=>setClosedSub(id)},l+' ('+n+')'))
               ),
               (closedSub==='all'||closedSub==='tp')&&renderClosedGroup('tp','🎯','Take-Profit Hits','Auto-closed at your target price',tpTrades,'tp','No trades have hit Take-Profit yet.'),
               (closedSub==='all'||closedSub==='sl')&&renderClosedGroup('sl','🛑','Stop-Loss Hits','Auto-closed to limit the loss',slTrades,'sl','No trades have hit Stop-Loss yet.'),
+              (closedSub==='all'||closedSub==='be')&&renderClosedGroup('be','⚖️','Breakeven Exits','After part of the profit was banked, the stop moved to breakeven and the rest was closed there. Usually a small win, not a loss.',beTrades,'be','No breakeven exits yet.'),
               (closedSub==='all'||closedSub==='time')&&renderClosedGroup('time','⏱','Time Exits','Closed at the max holding time using the real market price (TIME_WIN / TIME_LOSS)',timeTrades,'time','No time exits yet.'),
               (closedSub==='all'||closedSub==='manual')&&renderClosedGroup('manual','✋','Manually Closed','You closed these by hand before TP/SL',manualTrades,'manual','No manual closes yet.')
             )
